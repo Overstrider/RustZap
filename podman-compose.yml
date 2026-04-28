@@ -1,0 +1,60 @@
+services:
+  rustzap:
+    build:
+      context: .
+      dockerfile: Containerfile
+    env_file:
+      - ${RUSTZAP_ENV_FILE:-.env.production}
+      - ${RUSTZAP_SECRETS_FILE:-.env.secrets}
+    ports:
+      - "${RUSTZAP_HOST_PORT:-8167}:8167"
+    volumes:
+      - ./data/rustzap:/data/rustzap:Z
+      - ./data/wa-sessions:/data/rustzap/wa-sessions:Z
+      - ./data/logs:/var/log/rustzap:Z
+    depends_on:
+      - postgres
+      - redpanda
+
+  postgres:
+    image: docker.io/library/postgres:16
+    environment:
+      POSTGRES_DB: rustzap
+      POSTGRES_USER: rustzap
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env.secrets}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data:Z
+    expose:
+      - "5432"
+
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:latest
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:9092
+    volumes:
+      - ./data/redpanda:/var/lib/redpanda/data:Z
+    expose:
+      - "9092"
+
+  dev-tester:
+    profiles: ["dev"]
+    image: docker.io/library/node:22-bookworm
+    working_dir: /app
+    command: sh -lc "npm install && npm run dev -- --hostname 0.0.0.0 --port 3167"
+    env_file:
+      - dev-tester/.env.local.example
+    volumes:
+      - ./dev-tester:/app:Z
+    ports:
+      - "3167:3167"
+    depends_on:
+      - rustzap

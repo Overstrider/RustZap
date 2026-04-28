@@ -1,0 +1,7 @@
+[features]
+multi_agent_v2 = true
+
+[codedungeon]
+provider = "codex"
+pack = "codedungeon-codex"
+pack_version = "1"

@@ -1,0 +1,10 @@
+.next/
+node_modules/
+out/
+.env.local
+npm-debug.log*
+examples/.venv/
+examples/venv/
+examples/__pycache__/
+examples/.env
+examples/.env.local

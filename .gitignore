@@ -13,6 +13,29 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
+.env
+.env.production
+.env.development
+.env.secrets
+data/
+dev-tester/.next/
+dev-tester/node_modules/
+dev-tester/out/
+dev-tester/tsconfig.tsbuildinfo
+dev-tester/.env.local
+dev-tester/examples/.venv/
+dev-tester/examples/venv/
+dev-tester/examples/__pycache__/
+dev-tester/examples/.env
+dev-tester/examples/.env.local
+
+# Local codedungeon/Codex runtime artifacts
+.codedungeon/codedungeon.db
+.codedungeon/plan/
+.codedungeon/state/
+.codex/bin/
+codedungeon/
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore

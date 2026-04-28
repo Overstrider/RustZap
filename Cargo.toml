@@ -1,0 +1,43 @@
+[package]
+name = "rustzap"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8.9", features = ["ws", "macros", "multipart"] }
+base64 = "0.22"
+hex = "0.4"
+hmac = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+rusty-s3 = "0.9.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+time = { version = "0.3", features = ["serde", "serde-well-known", "formatting", "macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["serde", "v4", "v7"] }
+whatsapp-rust = { version = "0.5.0", default-features = false, features = ["sqlite-storage", "tokio-transport", "tokio-runtime", "ureq-client", "tokio-native", "signal", "moka-cache"] }
+wacore = { version = "0.5.0", default-features = false }
+waproto = "0.5.0"
+whatsapp-rust-tokio-transport = "0.5.0"
+whatsapp-rust-ureq-http-client = "0.5.0"
+
+rdkafka = { version = "0.39.0", optional = true }
+sqlx-core = { version = "0.8.6", default-features = false, features = ["json", "time", "uuid", "migrate", "_rt-tokio", "_tls-rustls-ring-webpki"] }
+sqlx-postgres = { version = "0.8.6", default-features = false, features = ["json", "time", "uuid", "migrate"] }
+
+[features]
+default = []
+external-integrations = ["dep:rdkafka"]
+
+[dev-dependencies]
+futures-util = "0.3.32"
+tokio-tungstenite = "0.29.0"
+tower = { version = "0.5", features = ["util"] }
