@@ -4,6 +4,10 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use uuid::Uuid;
 
+tokio::task_local! {
+    static REQUEST_ID: String;
+}
+
 #[derive(Debug, Error)]
 pub enum ApiError {
     #[error("{0}")]
@@ -84,7 +88,7 @@ impl IntoResponse for ApiError {
                 code: self.code(),
                 message: self.to_string(),
                 details: json!({}),
-                request_id: format!("req_{}", Uuid::now_v7().simple()),
+                request_id: current_request_id(),
             },
         };
         (status, Json(body)).into_response()
@@ -92,3 +96,20 @@ impl IntoResponse for ApiError {
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
+
+pub fn new_request_id() -> String {
+    format!("req_{}", Uuid::now_v7().simple())
+}
+
+pub fn current_request_id() -> String {
+    REQUEST_ID
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| new_request_id())
+}
+
+pub async fn scope_request_id<F>(request_id: String, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    REQUEST_ID.scope(request_id, future).await
+}

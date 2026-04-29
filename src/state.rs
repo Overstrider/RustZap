@@ -1,8 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
     env,
+    io::Cursor,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration as StdDuration,
 };
 
@@ -13,25 +17,30 @@ use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+
 use crate::{
-    config::{AppConfig, EventBusMode, MetadataDbMode},
+    config::{AppConfig, ConsumerSignalMode, EventBusMode, MetadataDbMode},
     db::{KafkaDeadLetterRecord, MetadataDb},
     error::{ApiError, ApiResult},
     eventbus::{EventBusHandle, dirty_signal, new_event},
-    media::{MediaDecision, MediaLimits, R2ObjectKeyInput, r2_object_key},
+    media::{MediaDecision, MediaLimits, R2ObjectKeyInput, magic_matches_mime, r2_object_key},
     models::{
         DirtyAckRequest, DirtyConversationItem, MediaObject, Message, MessagesPage, QrState,
         SendMessageRequest, SimulateInboundMediaRequest, SimulateInboundTextRequest, Transcript,
+        WebhookDeliveryAttempt,
     },
+    rate_limit::RateLimiter,
     security::sha256_json,
     storage::upload_r2_bytes,
     transcription::{
-        GroqSttClient, TranscriptLifecycle, mock_transcript, transcript_with_lifecycle,
+        GroqSttClient, TranscriptLifecycle, groq_transcript_from_result, mock_transcript,
+        transcript_with_lifecycle,
     },
     whatsapp::{
         ChannelRuntime, ContactProfile, GroupParticipantProfile, GroupProfile,
-        OutboundMediaMessage, WhatsappEvent, WhatsappManager, is_updates_surface_jid,
-        qr_expires_at, session_sqlite_path,
+        InboundMediaDescriptor, OutboundMediaMessage, WhatsappEvent, WhatsappManager,
+        is_updates_surface_jid, qr_expires_at, session_sqlite_path,
     },
 };
 
@@ -42,6 +51,8 @@ pub struct AppState {
     whatsapp: WhatsappManager,
     events_tx: broadcast::Sender<crate::models::CommonEvent>,
     event_bus: EventBusHandle,
+    rate_limiter: Arc<RateLimiter>,
+    metrics: Arc<RuntimeMetrics>,
     dev_state_path: Option<PathBuf>,
     metadata_db: Option<Arc<MetadataDb>>,
     metadata_persist_tx: Option<mpsc::UnboundedSender<PersistedStore>>,
@@ -50,6 +61,47 @@ pub struct AppState {
 pub struct SendMessageOutcome {
     pub message: Message,
     pub should_dispatch: bool,
+}
+
+pub struct RateLimitScope<'a> {
+    pub headers: &'a axum::http::HeaderMap,
+    pub api_key_id: &'a str,
+    pub project_id: Option<&'a str>,
+    pub company_id: Option<&'a str>,
+    pub family: &'a str,
+    pub resource_id: Option<&'a str>,
+    pub max_per_minute: u32,
+}
+
+struct InboundMediaRecordInput<'a> {
+    runtime: &'a ChannelRuntime,
+    message: &'a Message,
+    conversation_id: &'a str,
+    descriptor: &'a InboundMediaDescriptor,
+    media_id: String,
+    size_bytes: u64,
+    sha256: String,
+    storage_status: &'a str,
+    object_key: Option<String>,
+    bytes: Option<Vec<u8>>,
+}
+
+#[derive(Default)]
+struct RuntimeMetrics {
+    rate_limited_total: AtomicU64,
+    webhook_delivery_attempts_total: AtomicU64,
+    webhook_delivery_successes_total: AtomicU64,
+    stt_requests_total: AtomicU64,
+    websocket_subscriptions_total: AtomicU64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeMetricsSnapshot {
+    pub rate_limited_total: u64,
+    pub webhook_delivery_attempts_total: u64,
+    pub webhook_delivery_successes_total: u64,
+    pub stt_requests_total: u64,
+    pub websocket_subscriptions_total: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +138,24 @@ struct WhatsappMessageInput {
     sender_alt_jid: Option<String>,
     sender_name: Option<String>,
     created_at_wa: OffsetDateTime,
+}
+
+struct WebhookDeliveryJob {
+    callback: Value,
+    event: crate::models::CommonEvent,
+    attempt: u32,
+    first_failed_at: Option<OffsetDateTime>,
+}
+
+struct WebhookAttemptInput<'a> {
+    callback_id: String,
+    event: &'a crate::models::CommonEvent,
+    attempt: u32,
+    status: &'static str,
+    http_status: Option<u16>,
+    error_message: Option<String>,
+    first_failed_at: Option<OffsetDateTime>,
+    next_retry_at: Option<OffsetDateTime>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -188,6 +258,7 @@ struct StoreInner {
     qr: HashMap<String, QrState>,
     events: Vec<crate::models::CommonEvent>,
     callbacks: HashMap<String, Value>,
+    webhook_delivery_attempts: Vec<WebhookDeliveryAttempt>,
     audit_logs: Vec<Value>,
 }
 
@@ -215,6 +286,8 @@ pub(crate) struct PersistedStore {
     pub(crate) qr: HashMap<String, QrState>,
     pub(crate) events: Vec<crate::models::CommonEvent>,
     pub(crate) callbacks: HashMap<String, Value>,
+    #[serde(default)]
+    pub(crate) webhook_delivery_attempts: Vec<WebhookDeliveryAttempt>,
     pub(crate) audit_logs: Vec<Value>,
 }
 
@@ -264,6 +337,7 @@ impl PersistedStore {
             qr: inner.qr.clone(),
             events: inner.events.clone(),
             callbacks: inner.callbacks.clone(),
+            webhook_delivery_attempts: inner.webhook_delivery_attempts.clone(),
             audit_logs: inner.audit_logs.clone(),
         })
     }
@@ -294,6 +368,7 @@ impl PersistedStore {
             qr: store.qr,
             events: store.events,
             callbacks: store.callbacks,
+            webhook_delivery_attempts: store.webhook_delivery_attempts,
             audit_logs: store.audit_logs,
         }
     }
@@ -547,6 +622,24 @@ fn persist_metadata_blocking(
     }
 }
 
+fn client_ip(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or("unknown")
+        .to_string()
+}
+
 impl AppState {
     pub fn new(config: AppConfig) -> Self {
         let (events_tx, _) = broadcast::channel(1024);
@@ -562,6 +655,8 @@ impl AppState {
             whatsapp: WhatsappManager::default(),
             events_tx,
             event_bus,
+            rate_limiter: Arc::new(RateLimiter::default()),
+            metrics: Arc::new(RuntimeMetrics::default()),
             dev_state_path,
             metadata_db: None,
             metadata_persist_tx: None,
@@ -578,16 +673,20 @@ impl AppState {
                 .as_deref()
                 .and_then(load_dev_state)
                 .unwrap_or_default();
-            return Ok(Self {
+            let state = Self {
                 config: Arc::new(config),
                 inner: Arc::new(Mutex::new(inner)),
                 whatsapp: WhatsappManager::default(),
                 events_tx,
                 event_bus,
+                rate_limiter: Arc::new(RateLimiter::default()),
+                metrics: Arc::new(RuntimeMetrics::default()),
                 dev_state_path,
                 metadata_db: None,
                 metadata_persist_tx: None,
-            });
+            };
+            state.spawn_webhook_delivery_worker();
+            return Ok(state);
         }
 
         let metadata_db = Arc::new(MetadataDb::connect(&config).await?);
@@ -620,12 +719,33 @@ impl AppState {
             whatsapp: WhatsappManager::default(),
             events_tx,
             event_bus,
+            rate_limiter: Arc::new(RateLimiter::default()),
+            metrics: Arc::new(RuntimeMetrics::default()),
             dev_state_path: None,
             metadata_db: Some(metadata_db),
             metadata_persist_tx: Some(metadata_persist_tx),
         };
         crate::workers::spawn_kafka_workers(state.clone());
+        state.spawn_webhook_delivery_worker();
         Ok(state)
+    }
+
+    fn spawn_webhook_delivery_worker(&self) {
+        if !self.config.webhook.delivery_enabled || !self.webhook_signal_enabled() {
+            return;
+        }
+        let state = self.clone();
+        let interval_seconds = state.config.webhook.retry_base_seconds.clamp(1, 60);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(StdDuration::from_secs(interval_seconds));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                if let Err(err) = state.deliver_pending_webhooks_once().await {
+                    tracing::warn!(error = %err, "webhook delivery cycle failed");
+                }
+            }
+        });
     }
 
     pub async fn metadata_ready(&self) -> anyhow::Result<()> {
@@ -641,6 +761,25 @@ impl AppState {
 
     pub fn event_bus_snapshot(&self) -> crate::eventbus::EventBusRuntimeSnapshot {
         self.event_bus.snapshot()
+    }
+
+    pub fn runtime_metrics_snapshot(&self) -> RuntimeMetricsSnapshot {
+        RuntimeMetricsSnapshot {
+            rate_limited_total: self.metrics.rate_limited_total.load(Ordering::Relaxed),
+            webhook_delivery_attempts_total: self
+                .metrics
+                .webhook_delivery_attempts_total
+                .load(Ordering::Relaxed),
+            webhook_delivery_successes_total: self
+                .metrics
+                .webhook_delivery_successes_total
+                .load(Ordering::Relaxed),
+            stt_requests_total: self.metrics.stt_requests_total.load(Ordering::Relaxed),
+            websocket_subscriptions_total: self
+                .metrics
+                .websocket_subscriptions_total
+                .load(Ordering::Relaxed),
+        }
     }
 
     #[cfg(feature = "external-integrations")]
@@ -694,6 +833,42 @@ impl AppState {
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<crate::models::CommonEvent> {
         self.events_tx.subscribe()
+    }
+
+    pub fn enforce_rate_limit(&self, scope: RateLimitScope<'_>) -> ApiResult<()> {
+        let mut keys = vec![
+            format!("api_key:{}:family:{}", scope.api_key_id, scope.family),
+            format!("ip:{}:family:{}", client_ip(scope.headers), scope.family),
+        ];
+        if let Some(project_id) = scope.project_id {
+            keys.push(format!("project:{project_id}:family:{}", scope.family));
+        }
+        if let (Some(project_id), Some(company_id)) = (scope.project_id, scope.company_id) {
+            keys.push(format!(
+                "company:{project_id}/{company_id}:family:{}",
+                scope.family
+            ));
+        }
+        if let Some(resource_id) = scope.resource_id {
+            keys.push(format!("resource:{}:{resource_id}", scope.family));
+        }
+        self.rate_limiter
+            .check(&keys, scope.max_per_minute)
+            .map_err(|decision| {
+                self.metrics
+                    .rate_limited_total
+                    .fetch_add(1, Ordering::Relaxed);
+                ApiError::RateLimited(format!(
+                    "rate limit exceeded for {}; retry after {} seconds",
+                    scope.family, decision.retry_after_seconds
+                ))
+            })
+    }
+
+    pub fn record_websocket_subscription_metric(&self) {
+        self.metrics
+            .websocket_subscriptions_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn is_whatsapp_channel_active(&self, channel_id: &str) -> bool {
@@ -1383,6 +1558,9 @@ impl AppState {
             permanent_object_key: None,
             public_url: public_url.clone(),
             thumbnail_url: thumbnail_url.clone(),
+            width: None,
+            height: None,
+            duration_seconds: None,
             expires_at: Some(now + Duration::days(self.config.media_temp_retention_days.into())),
             saved_at: None,
             created_at: now,
@@ -1722,6 +1900,7 @@ impl AppState {
                 push_name,
                 text,
                 message_type,
+                media,
                 created_at_wa,
                 is_from_me,
             } => {
@@ -1842,6 +2021,40 @@ impl AppState {
                     sender_name,
                     created_at_wa,
                 });
+                if let Some(media) = media {
+                    let descriptor = *media;
+                    self.push_event(new_event(
+                        "media.download.requested",
+                        &runtime.project_id,
+                        &runtime.company_id,
+                        Some(runtime.channel_id.clone()),
+                        Some(chat_jid.clone()),
+                        Some(message.id.clone()),
+                        Some(message.conversation_seq),
+                        json!({
+                            "message_id": message.id.clone(),
+                            "media": descriptor.clone()
+                        }),
+                    ));
+                    if let Err(err) = self
+                        .download_and_store_inbound_media(&runtime, &message, &chat_jid, descriptor)
+                        .await
+                    {
+                        self.push_event(new_event(
+                            "media.download.failed",
+                            &runtime.project_id,
+                            &runtime.company_id,
+                            Some(runtime.channel_id.clone()),
+                            Some(chat_jid.clone()),
+                            Some(message.id.clone()),
+                            Some(message.conversation_seq),
+                            json!({
+                                "message_id": message.id.clone(),
+                                "error": err.to_string()
+                            }),
+                        ));
+                    }
+                }
                 if let Some(contact_id_for_enrichment) = contact_id_for_enrichment
                     && !contact_id_for_enrichment.trim().is_empty()
                 {
@@ -3341,6 +3554,259 @@ impl AppState {
             .ok_or_else(|| ApiError::NotFound(format!("media {media_id} not found")))
     }
 
+    async fn download_and_store_inbound_media(
+        &self,
+        runtime: &ChannelRuntime,
+        message: &Message,
+        conversation_id: &str,
+        descriptor: InboundMediaDescriptor,
+    ) -> ApiResult<MediaObject> {
+        let limits = MediaLimits {
+            quick_delete_threshold_mb: self.config.media_quick_delete_threshold_mb,
+            reject_threshold_mb: self.config.media_reject_threshold_mb,
+        };
+        let media_id = format!("media_{}", Uuid::now_v7().simple());
+        if limits.classify(descriptor.file_length) == MediaDecision::Rejected {
+            return self.record_inbound_media_object(InboundMediaRecordInput {
+                runtime,
+                message,
+                conversation_id,
+                descriptor: &descriptor,
+                media_id,
+                size_bytes: descriptor.file_length,
+                sha256: descriptor_sha256_hex(&descriptor),
+                storage_status: "rejected",
+                object_key: None,
+                bytes: None,
+            });
+        }
+
+        let writer = Cursor::new(Vec::with_capacity(
+            usize::try_from(descriptor.file_length)
+                .unwrap_or(0)
+                .min(8 * 1024 * 1024),
+        ));
+        let writer = self
+            .whatsapp
+            .download_inbound_media_to_writer(&runtime.channel_id, &descriptor, writer)
+            .await
+            .map_err(|err| {
+                ApiError::Internal(format!("failed to download WhatsApp media: {err}"))
+            })?;
+        let bytes = writer.into_inner();
+        self.store_downloaded_inbound_media(runtime, message, conversation_id, descriptor, bytes)
+    }
+
+    fn store_downloaded_inbound_media(
+        &self,
+        runtime: &ChannelRuntime,
+        message: &Message,
+        conversation_id: &str,
+        descriptor: InboundMediaDescriptor,
+        bytes: Vec<u8>,
+    ) -> ApiResult<MediaObject> {
+        if bytes.is_empty() {
+            return Err(ApiError::BadRequest(
+                "downloaded WhatsApp media is empty".to_string(),
+            ));
+        }
+        let size_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let limits = MediaLimits {
+            quick_delete_threshold_mb: self.config.media_quick_delete_threshold_mb,
+            reject_threshold_mb: self.config.media_reject_threshold_mb,
+        };
+        let decision = limits.classify(size_bytes);
+        if decision == MediaDecision::Rejected {
+            return self.record_inbound_media_object(InboundMediaRecordInput {
+                runtime,
+                message,
+                conversation_id,
+                descriptor: &descriptor,
+                media_id: format!("media_{}", Uuid::now_v7().simple()),
+                size_bytes,
+                sha256: hex::encode(Sha256::digest(&bytes)),
+                storage_status: "rejected",
+                object_key: None,
+                bytes: None,
+            });
+        }
+
+        let media_id = format!("media_{}", Uuid::now_v7().simple());
+        let staging_path = self.stage_media_bytes(&media_id, &bytes)?;
+        if self.config.media_sniff_magic_bytes
+            && !magic_matches_mime(Some(&descriptor.mime_type), &bytes)
+        {
+            let _ = std::fs::remove_file(&staging_path);
+            return Err(ApiError::BadRequest(format!(
+                "downloaded WhatsApp media magic bytes do not match declared MIME type {}",
+                descriptor.mime_type
+            )));
+        }
+
+        let storage_status = match decision {
+            MediaDecision::Temp => "temp",
+            MediaDecision::Quarantine => "quarantine",
+            MediaDecision::Rejected => unreachable!("rejected media returned earlier"),
+        };
+        let ext = descriptor
+            .filename
+            .as_deref()
+            .and_then(file_extension)
+            .unwrap_or_else(|| extension_for_mime(&descriptor.mime_type));
+        let object_key = Some(r2_object_key(R2ObjectKeyInput {
+            base_prefix: &self.config.r2.base_prefix,
+            class: storage_status,
+            project_id: &runtime.project_id,
+            company_id: &runtime.company_id,
+            channel_id: &runtime.channel_id,
+            conversation_id: Some(conversation_id),
+            entity_type: None,
+            entity_id: None,
+            date: OffsetDateTime::now_utc().date(),
+            media_id: &media_id,
+            ext,
+        }));
+        let media = self.record_inbound_media_object(InboundMediaRecordInput {
+            runtime,
+            message,
+            conversation_id,
+            descriptor: &descriptor,
+            media_id,
+            size_bytes,
+            sha256: hex::encode(Sha256::digest(&bytes)),
+            storage_status,
+            object_key: object_key.clone(),
+            bytes: Some(bytes.clone()),
+        });
+        let _ = std::fs::remove_file(&staging_path);
+        let media = media?;
+        if self.config.r2.can_upload()
+            && let Some(object_key) = object_key
+        {
+            let config = self.config.r2.clone();
+            let mime_type = descriptor.mime_type.clone();
+            let media_id = media.id.clone();
+            tokio::spawn(async move {
+                if let Err(err) = upload_r2_bytes(&config, &object_key, &mime_type, bytes).await {
+                    tracing::warn!(media_id, error = %err, "R2 inbound media upload failed");
+                }
+            });
+        }
+        Ok(media)
+    }
+
+    fn record_inbound_media_object(
+        &self,
+        input: InboundMediaRecordInput<'_>,
+    ) -> ApiResult<MediaObject> {
+        let media_type =
+            normalize_inbound_media_type(&input.descriptor.media_type, &input.descriptor.mime_type);
+        let mime_type = input.descriptor.mime_type.trim().to_string();
+        let now = OffsetDateTime::now_utc();
+        let public_object_url = input
+            .object_key
+            .as_deref()
+            .and_then(|object_key| self.config.public_object_url(object_key));
+        let local_url = (input.storage_status != "rejected")
+            .then(|| self.config.dev_media_url(&input.media_id));
+        let public_url = public_object_url.or(local_url);
+        let thumbnail_url = (media_type == "image")
+            .then(|| public_url.clone())
+            .flatten();
+        let media = MediaObject {
+            id: input.media_id.clone(),
+            project_id: input.runtime.project_id.clone(),
+            company_id: input.runtime.company_id.clone(),
+            conversation_id: input.conversation_id.to_string(),
+            message_id: Some(input.message.id.clone()),
+            media_type: media_type.clone(),
+            mime_type: mime_type.clone(),
+            original_filename: input.descriptor.filename.clone(),
+            size_bytes: input.size_bytes,
+            sha256: input.sha256,
+            storage_status: input.storage_status.to_string(),
+            bucket: input
+                .object_key
+                .as_ref()
+                .map(|_| self.config.r2.bucket.clone()),
+            object_key: input.object_key.clone(),
+            permanent_object_key: None,
+            public_url,
+            thumbnail_url,
+            width: input.descriptor.width,
+            height: input.descriptor.height,
+            duration_seconds: input.descriptor.duration_seconds,
+            expires_at: (input.storage_status != "rejected")
+                .then(|| now + Duration::days(self.config.media_temp_retention_days.into())),
+            saved_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let mut inner = self.inner.lock().expect("store lock poisoned");
+        inner.media.insert(media.id.clone(), media.clone());
+        let message = attach_media_to_message_inner(&mut inner, &input.message.id, &media)
+            .unwrap_or_else(|| input.message.clone());
+        if let Some(bytes) = input.bytes {
+            inner.media_blobs.insert(media.id.clone(), bytes);
+        }
+        push_event_inner(
+            &mut inner,
+            Some(&self.events_tx),
+            Some(&self.event_bus),
+            new_event(
+                "media.stored",
+                &input.runtime.project_id,
+                &input.runtime.company_id,
+                Some(input.runtime.channel_id.clone()),
+                Some(input.conversation_id.to_string()),
+                Some(message.id.clone()),
+                Some(message.conversation_seq),
+                json!({
+                    "message_id": message.id.clone(),
+                    "media_id": media.id.clone(),
+                    "media_type": media.media_type.clone(),
+                    "mime_type": media.mime_type.clone(),
+                    "storage_status": media.storage_status.clone(),
+                    "size_bytes": media.size_bytes
+                }),
+            ),
+        );
+        if media.media_type == "audio" && media.storage_status != "rejected" {
+            let transcript = transcript_with_lifecycle(
+                &input.runtime.project_id,
+                &input.runtime.company_id,
+                &message.id,
+                Some(media.id.clone()),
+                TranscriptLifecycle::Pending,
+                None,
+            );
+            inner
+                .transcripts
+                .insert(message.id.clone(), transcript.clone());
+            push_event_inner(
+                &mut inner,
+                Some(&self.events_tx),
+                Some(&self.event_bus),
+                new_event(
+                    "audio.transcription.requested",
+                    &input.runtime.project_id,
+                    &input.runtime.company_id,
+                    Some(input.runtime.channel_id.clone()),
+                    Some(input.conversation_id.to_string()),
+                    Some(message.id.clone()),
+                    Some(message.conversation_seq),
+                    json!({
+                        "message_id": message.id.clone(),
+                        "media_id": media.id.clone(),
+                        "transcript_id": transcript.id.clone()
+                    }),
+                ),
+            );
+        }
+        self.persist_locked(&inner);
+        Ok(media)
+    }
+
     pub fn media_blob(&self, media_id: &str) -> ApiResult<Option<(MediaObject, Vec<u8>)>> {
         let inner = self.inner.lock().expect("store lock poisoned");
         let media = inner
@@ -3397,6 +3863,15 @@ impl AppState {
             .unwrap_or_else(|| infer_media_type(&mime_type));
         let now = OffsetDateTime::now_utc();
         let media_id = format!("media_{}", Uuid::now_v7().simple());
+        let staging_path = self.stage_media_bytes(&media_id, &upload.bytes)?;
+        if self.config.media_sniff_magic_bytes
+            && !magic_matches_mime(Some(&mime_type), &upload.bytes)
+        {
+            let _ = std::fs::remove_file(&staging_path);
+            return Err(ApiError::BadRequest(format!(
+                "upload magic bytes do not match declared MIME type {mime_type}"
+            )));
+        }
         let channel_id = self
             .channel_for_conversation(conversation_id)
             .unwrap_or_else(|| "channel_dev".to_string());
@@ -3448,6 +3923,9 @@ impl AppState {
             permanent_object_key: None,
             public_url,
             thumbnail_url,
+            width: None,
+            height: None,
+            duration_seconds: None,
             expires_at: Some(now + Duration::days(self.config.media_temp_retention_days.into())),
             saved_at: None,
             created_at: now,
@@ -3471,7 +3949,65 @@ impl AppState {
                 }
             });
         }
+        let _ = std::fs::remove_file(staging_path);
         Ok(media)
+    }
+
+    fn stage_media_bytes(&self, media_id: &str, bytes: &[u8]) -> ApiResult<PathBuf> {
+        let preferred_dir = self.config.media_local_temp_dir.join("staging");
+        let staging_dir = if let Err(err) = std::fs::create_dir_all(&preferred_dir) {
+            #[cfg(test)]
+            {
+                let fallback_dir = std::env::temp_dir()
+                    .join("rustzap-test-media")
+                    .join("staging");
+                std::fs::create_dir_all(&fallback_dir).map_err(|fallback_err| {
+                    ApiError::Internal(format!(
+                        "failed to create media staging directory {} ({err}); fallback {} failed: {fallback_err}",
+                        preferred_dir.display(),
+                        fallback_dir.display()
+                    ))
+                })?;
+                fallback_dir
+            }
+            #[cfg(not(test))]
+            {
+                return Err(ApiError::Internal(format!(
+                    "failed to create media staging directory {}: {err}",
+                    preferred_dir.display()
+                )));
+            }
+        } else {
+            preferred_dir
+        };
+        std::fs::create_dir_all(&staging_dir).map_err(|err| {
+            ApiError::Internal(format!(
+                "failed to create media staging directory {}: {err}",
+                staging_dir.display()
+            ))
+        })?;
+        let staging_path = staging_dir.join(format!("{media_id}.upload"));
+        std::fs::write(&staging_path, bytes).map_err(|err| {
+            ApiError::Internal(format!(
+                "failed to write media staging file {}: {err}",
+                staging_path.display()
+            ))
+        })?;
+        let written = std::fs::metadata(&staging_path)
+            .map(|metadata| metadata.len())
+            .map_err(|err| {
+                ApiError::Internal(format!(
+                    "failed to stat media staging file {}: {err}",
+                    staging_path.display()
+                ))
+            })?;
+        if written != u64::try_from(bytes.len()).unwrap_or(u64::MAX) {
+            let _ = std::fs::remove_file(&staging_path);
+            return Err(ApiError::Internal(
+                "staged media size does not match upload size".to_string(),
+            ));
+        }
+        Ok(staging_path)
     }
 
     pub fn media_for_conversation(&self, conversation_id: &str) -> Vec<MediaObject> {
@@ -3619,6 +4155,16 @@ impl AppState {
         entity_type: &str,
         entity_id: &str,
     ) -> ApiResult<MediaObject> {
+        self.save_media_with_permanent_object_key(media_id, entity_type, entity_id, None)
+    }
+
+    fn save_media_with_permanent_object_key(
+        &self,
+        media_id: &str,
+        entity_type: &str,
+        entity_id: &str,
+        permanent_object_key: Option<String>,
+    ) -> ApiResult<MediaObject> {
         let mut inner = self.inner.lock().expect("store lock poisoned");
         let media = inner
             .media
@@ -3626,18 +4172,20 @@ impl AppState {
             .ok_or_else(|| ApiError::NotFound(format!("media {media_id} not found")))?;
         let now = OffsetDateTime::now_utc();
         media.storage_status = "permanent".to_string();
-        let object_key = r2_object_key(R2ObjectKeyInput {
-            base_prefix: &self.config.r2.base_prefix,
-            class: "permanent",
-            project_id: &media.project_id,
-            company_id: &media.company_id,
-            channel_id: "channel_dev",
-            conversation_id: Some(&media.conversation_id),
-            entity_type: Some(entity_type),
-            entity_id: Some(entity_id),
-            date: now.date(),
-            media_id,
-            ext: "bin",
+        let object_key = permanent_object_key.unwrap_or_else(|| {
+            r2_object_key(R2ObjectKeyInput {
+                base_prefix: &self.config.r2.base_prefix,
+                class: "permanent",
+                project_id: &media.project_id,
+                company_id: &media.company_id,
+                channel_id: "channel_dev",
+                conversation_id: Some(&media.conversation_id),
+                entity_type: Some(entity_type),
+                entity_id: Some(entity_id),
+                date: now.date(),
+                media_id,
+                ext: "bin",
+            })
         });
         media.permanent_object_key = Some(object_key.clone());
         media.public_url = self.config.public_object_url(&object_key);
@@ -3664,6 +4212,86 @@ impl AppState {
     ) -> ApiResult<MediaObject> {
         self.media_for_company(project_id, company_id, media_id)?;
         self.save_media(media_id, entity_type, entity_id)
+    }
+
+    pub fn save_media_with_permanent_object_key_for_company(
+        &self,
+        project_id: &str,
+        company_id: &str,
+        media_id: &str,
+        entity_type: &str,
+        entity_id: &str,
+        permanent_object_key: String,
+    ) -> ApiResult<MediaObject> {
+        self.media_for_company(project_id, company_id, media_id)?;
+        self.save_media_with_permanent_object_key(
+            media_id,
+            entity_type,
+            entity_id,
+            Some(permanent_object_key),
+        )
+    }
+
+    pub fn delete_media_for_company(
+        &self,
+        project_id: &str,
+        company_id: &str,
+        media_id: &str,
+    ) -> ApiResult<MediaObject> {
+        self.media_for_company(project_id, company_id, media_id)?;
+        let mut inner = self.inner.lock().expect("store lock poisoned");
+        let media = inner
+            .media
+            .get_mut(media_id)
+            .ok_or_else(|| ApiError::NotFound(format!("media {media_id} not found")))?;
+        media.storage_status = "deleted".to_string();
+        media.public_url = None;
+        media.thumbnail_url = None;
+        media.expires_at = None;
+        media.updated_at = OffsetDateTime::now_utc();
+        let updated = media.clone();
+        inner.media_blobs.remove(media_id);
+        self.persist_locked(&inner);
+        Ok(updated)
+    }
+
+    pub fn cleanup_expired_temp_media(&self) -> usize {
+        let now = OffsetDateTime::now_utc();
+        let mut inner = self.inner.lock().expect("store lock poisoned");
+        let expired_ids: Vec<_> = inner
+            .media
+            .iter()
+            .filter(|(_, media)| {
+                matches!(
+                    media.storage_status.as_str(),
+                    "temp" | "quarantine" | "outbound-temp"
+                ) && media.expires_at.is_some_and(|expires_at| expires_at <= now)
+            })
+            .map(|(media_id, _)| media_id.clone())
+            .collect();
+        for media_id in &expired_ids {
+            inner.media.remove(media_id);
+            inner.media_blobs.remove(media_id);
+        }
+        if !expired_ids.is_empty() {
+            self.persist_locked(&inner);
+        }
+        expired_ids.len()
+    }
+
+    pub fn cleanup_staging_files(&self) -> usize {
+        let staging_dir = self.config.media_local_temp_dir.join("staging");
+        let Ok(entries) = std::fs::read_dir(staging_dir) else {
+            return 0;
+        };
+        let mut removed = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && std::fs::remove_file(path).is_ok() {
+                removed += 1;
+            }
+        }
+        removed
     }
 
     pub fn transcript(&self, message_id: &str) -> ApiResult<Transcript> {
@@ -3771,9 +4399,9 @@ impl AppState {
                 Some(message.id.clone()),
                 Some(message.conversation_seq),
                 json!({
-                    "message_id": message.id,
-                    "media_id": media.id,
-                    "transcript_id": transcript.id
+                    "message_id": message.id.clone(),
+                    "media_id": media.id.clone(),
+                    "transcript_id": transcript.id.clone()
                 }),
             ),
         );
@@ -3817,6 +4445,9 @@ impl AppState {
         &self,
         event: &crate::models::CommonEvent,
     ) -> ApiResult<Transcript> {
+        self.metrics
+            .stt_requests_total
+            .fetch_add(1, Ordering::Relaxed);
         let message_id = event
             .payload
             .get("message_id")
@@ -3895,12 +4526,7 @@ impl AppState {
             .transcribe_bytes(&filename, &media.mime_type, bytes)
             .await
         {
-            Ok(text) => self.set_transcript_lifecycle(
-                &message,
-                &media,
-                TranscriptLifecycle::Completed,
-                Some(text),
-            ),
+            Ok(result) => self.set_completed_groq_transcript(&message, &media, result),
             Err(error) => self.set_transcript_lifecycle(
                 &message,
                 &media,
@@ -3965,6 +4591,79 @@ impl AppState {
                 Some(&self.event_bus),
             );
         }
+        self.persist_locked(&inner);
+        Ok(transcript)
+    }
+
+    fn set_completed_groq_transcript(
+        &self,
+        message: &Message,
+        media: &MediaObject,
+        result: crate::transcription::GroqTranscription,
+    ) -> ApiResult<Transcript> {
+        let mut transcript = groq_transcript_from_result(
+            &message.project_id,
+            &message.company_id,
+            &message.id,
+            Some(media.id.clone()),
+            result,
+        );
+        let mut inner = self.inner.lock().expect("store lock poisoned");
+        if let Some(existing) = inner.transcripts.get(&message.id) {
+            transcript.id = existing.id.clone();
+            transcript.created_at = existing.created_at;
+        }
+        inner
+            .transcripts
+            .insert(message.id.clone(), transcript.clone());
+        push_event_inner(
+            &mut inner,
+            Some(&self.events_tx),
+            Some(&self.event_bus),
+            new_event(
+                "audio.transcribed",
+                &message.project_id,
+                &message.company_id,
+                Some(message.channel_account_id.clone()),
+                Some(message.conversation_id.clone()),
+                Some(message.id.clone()),
+                Some(message.conversation_seq),
+                json!({
+                    "message_id": message.id.clone(),
+                    "media_id": media.id.clone(),
+                    "transcript_id": transcript.id.clone()
+                }),
+            ),
+        );
+        push_event_inner(
+            &mut inner,
+            Some(&self.events_tx),
+            Some(&self.event_bus),
+            new_event(
+                "transcript.completed",
+                &message.project_id,
+                &message.company_id,
+                Some(message.channel_account_id.clone()),
+                Some(message.conversation_id.clone()),
+                Some(message.id.clone()),
+                Some(message.conversation_seq),
+                json!({
+                    "message_id": message.id.clone(),
+                    "media_id": media.id.clone(),
+                    "transcript_id": transcript.id.clone()
+                }),
+            ),
+        );
+        mark_dirty_inner(
+            &mut inner,
+            &message.project_id,
+            &message.company_id,
+            &message.conversation_id,
+            message.conversation_seq,
+            &message.channel_account_id,
+            Some(&self.events_tx),
+            Some(&self.event_bus),
+        );
         self.persist_locked(&inner);
         Ok(transcript)
     }
@@ -4137,7 +4836,7 @@ impl AppState {
                 callback["project_id"].as_str() == Some(project_id)
                     && callback["company_id"].as_str() == Some(company_id)
             })
-            .cloned()
+            .map(sanitize_callback)
             .collect();
         callbacks.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
         callbacks
@@ -4161,11 +4860,23 @@ impl AppState {
             .and_then(|value| value["created_at"].as_str())
             .map(str::to_string)
             .unwrap_or_else(|| ts(now));
+        let secret = body
+            .get("secret")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                existing
+                    .as_ref()
+                    .and_then(|value| value["secret"].as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| format!("whsec_{}", Uuid::now_v7().simple()));
         let callback = json!({
             "id": callback_id,
             "project_id": project_id,
             "company_id": company_id,
             "url": body.get("url").and_then(Value::as_str).unwrap_or("http://localhost:3000/webhook"),
+            "secret": secret,
             "enabled": body.get("enabled").and_then(Value::as_bool).unwrap_or(true),
             "events": body.get("events").cloned().unwrap_or_else(|| json!(["conversation.dirty"])),
             "max_batch_size": body.get("max_batch_size").and_then(Value::as_u64).unwrap_or(self.config.webhook.max_batch_size as u64),
@@ -4184,7 +4895,7 @@ impl AppState {
             callback["id"].as_str(),
             json!({"enabled": callback["enabled"]}),
         );
-        callback
+        sanitize_callback(&callback)
     }
 
     pub fn delete_callback(
@@ -4208,7 +4919,213 @@ impl AppState {
             Some(callback_id),
             json!({"deleted": true}),
         );
-        Ok(json!({"deleted": true, "callback": callback}))
+        Ok(json!({"deleted": true, "callback": sanitize_callback(&callback)}))
+    }
+
+    pub fn webhook_delivery_attempts(&self, project_id: &str, company_id: &str) -> Vec<Value> {
+        self.inner
+            .lock()
+            .expect("store lock poisoned")
+            .webhook_delivery_attempts
+            .iter()
+            .filter(|attempt| attempt.project_id == project_id && attempt.company_id == company_id)
+            .map(|attempt| json!(attempt))
+            .collect()
+    }
+
+    pub async fn deliver_pending_webhooks_once(&self) -> ApiResult<usize> {
+        if !self.config.webhook.delivery_enabled || !self.webhook_signal_enabled() {
+            return Ok(0);
+        }
+        let jobs = self.pending_webhook_jobs();
+        let mut delivered = 0;
+        for job in jobs {
+            self.deliver_webhook_job(job).await?;
+            delivered += 1;
+        }
+        Ok(delivered)
+    }
+
+    fn webhook_signal_enabled(&self) -> bool {
+        matches!(
+            self.config.consumer_signal_mode,
+            ConsumerSignalMode::Webhook | ConsumerSignalMode::WebhookAndPolling
+        )
+    }
+
+    fn pending_webhook_jobs(&self) -> Vec<WebhookDeliveryJob> {
+        let now = OffsetDateTime::now_utc();
+        let inner = self.inner.lock().expect("store lock poisoned");
+        let mut jobs = Vec::new();
+        for callback in inner.callbacks.values() {
+            if callback["enabled"].as_bool() != Some(true) {
+                continue;
+            }
+            let project_id = callback["project_id"].as_str().unwrap_or_default();
+            let company_id = callback["company_id"].as_str().unwrap_or_default();
+            for event in &inner.events {
+                if event.project_id != project_id || event.company_id != company_id {
+                    continue;
+                }
+                if !callback_subscribes_to_event(callback, &event.event_type) {
+                    continue;
+                }
+                let callback_id = callback["id"].as_str().unwrap_or_default();
+                let attempts: Vec<_> = inner
+                    .webhook_delivery_attempts
+                    .iter()
+                    .filter(|attempt| {
+                        attempt.callback_id == callback_id && attempt.event_id == event.event_id
+                    })
+                    .collect();
+                if attempts.iter().any(|attempt| attempt.status == "success") {
+                    continue;
+                }
+                let Some(last_attempt) = attempts.iter().max_by_key(|attempt| attempt.attempt)
+                else {
+                    jobs.push(WebhookDeliveryJob {
+                        callback: callback.clone(),
+                        event: event.clone(),
+                        attempt: 1,
+                        first_failed_at: None,
+                    });
+                    continue;
+                };
+                if last_attempt.attempt >= self.config.webhook.max_retries {
+                    continue;
+                }
+                if last_attempt
+                    .next_retry_at
+                    .is_some_and(|next_retry_at| next_retry_at > now)
+                {
+                    continue;
+                }
+                jobs.push(WebhookDeliveryJob {
+                    callback: callback.clone(),
+                    event: event.clone(),
+                    attempt: last_attempt.attempt.saturating_add(1),
+                    first_failed_at: last_attempt
+                        .first_failed_at
+                        .or(Some(last_attempt.created_at)),
+                });
+            }
+        }
+        jobs
+    }
+
+    async fn deliver_webhook_job(&self, job: WebhookDeliveryJob) -> ApiResult<()> {
+        let callback_id = job.callback["id"].as_str().unwrap_or_default().to_string();
+        let url = job.callback["url"]
+            .as_str()
+            .ok_or_else(|| ApiError::BadRequest("callback url is required".to_string()))?
+            .to_string();
+        let secret = job.callback["secret"].as_str().unwrap_or_default();
+        let body = serde_json::to_vec(&json!({
+            "events": [compact_webhook_event(&job.event)]
+        }))
+        .map_err(|err| ApiError::Internal(format!("failed to encode webhook body: {err}")))?;
+        let timestamp = OffsetDateTime::now_utc().unix_timestamp().to_string();
+        let signature = crate::security::webhook_signature(secret, &timestamp, &body);
+        let timeout_seconds = job
+            .callback
+            .get("timeout_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(self.config.webhook.timeout_seconds);
+        let response = reqwest::Client::builder()
+            .timeout(StdDuration::from_secs(timeout_seconds.max(1)))
+            .build()
+            .map_err(|err| ApiError::Internal(format!("failed to build webhook client: {err}")))?
+            .post(&url)
+            .header("content-type", "application/json")
+            .header(&self.config.webhook.signing_header, signature)
+            .header(&self.config.webhook.timestamp_header, timestamp)
+            .header(&self.config.webhook.event_id_header, &job.event.event_id)
+            .body(body)
+            .send()
+            .await;
+
+        match response {
+            Ok(response) if response.status().is_success() => {
+                self.record_webhook_attempt(WebhookAttemptInput {
+                    callback_id,
+                    event: &job.event,
+                    attempt: job.attempt,
+                    status: "success",
+                    http_status: Some(response.status().as_u16()),
+                    error_message: None,
+                    first_failed_at: None,
+                    next_retry_at: None,
+                });
+            }
+            Ok(response) => {
+                self.record_webhook_attempt(WebhookAttemptInput {
+                    callback_id,
+                    event: &job.event,
+                    attempt: job.attempt,
+                    status: "failed",
+                    http_status: Some(response.status().as_u16()),
+                    error_message: Some(format!("webhook returned {}", response.status())),
+                    first_failed_at: job.first_failed_at,
+                    next_retry_at: Some(next_webhook_retry_at(
+                        job.attempt,
+                        self.config.webhook.retry_base_seconds,
+                        self.config.webhook.retry_max_seconds,
+                    )),
+                });
+            }
+            Err(err) => {
+                self.record_webhook_attempt(WebhookAttemptInput {
+                    callback_id,
+                    event: &job.event,
+                    attempt: job.attempt,
+                    status: "failed",
+                    http_status: None,
+                    error_message: Some(err.to_string()),
+                    first_failed_at: job.first_failed_at,
+                    next_retry_at: Some(next_webhook_retry_at(
+                        job.attempt,
+                        self.config.webhook.retry_base_seconds,
+                        self.config.webhook.retry_max_seconds,
+                    )),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn record_webhook_attempt(&self, input: WebhookAttemptInput<'_>) {
+        let now = OffsetDateTime::now_utc();
+        self.metrics
+            .webhook_delivery_attempts_total
+            .fetch_add(1, Ordering::Relaxed);
+        if input.status == "success" {
+            self.metrics
+                .webhook_delivery_successes_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let mut inner = self.inner.lock().expect("store lock poisoned");
+        inner
+            .webhook_delivery_attempts
+            .push(WebhookDeliveryAttempt {
+                id: Uuid::now_v7().to_string(),
+                project_id: input.event.project_id.clone(),
+                company_id: input.event.company_id.clone(),
+                callback_id: input.callback_id,
+                event_id: input.event.event_id.clone(),
+                attempt: input.attempt,
+                status: input.status.to_string(),
+                http_status: input.http_status,
+                error_message: input.error_message,
+                first_failed_at: if input.status == "failed" {
+                    input.first_failed_at.or(Some(now))
+                } else {
+                    None
+                },
+                last_failed_at: (input.status == "failed").then_some(now),
+                next_retry_at: input.next_retry_at,
+                created_at: now,
+            });
+        self.persist_locked(&inner);
     }
 
     pub fn privacy_export_contact(
@@ -5272,6 +6189,22 @@ fn infer_media_type(mime_type: &str) -> String {
     }
 }
 
+fn normalize_inbound_media_type(value: &str, mime_type: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "image" | "audio" | "video" | "document" => value.trim().to_ascii_lowercase(),
+        "file" | "application" => "document".to_string(),
+        _ if mime_type.starts_with("video/") => "video".to_string(),
+        _ => infer_media_type(mime_type),
+    }
+}
+
+fn descriptor_sha256_hex(descriptor: &InboundMediaDescriptor) -> String {
+    BASE64_STANDARD
+        .decode(descriptor.file_sha256_b64.as_bytes())
+        .map(hex::encode)
+        .unwrap_or_default()
+}
+
 fn file_extension(filename: &str) -> Option<&str> {
     filename
         .rsplit_once('.')
@@ -5290,6 +6223,8 @@ fn extension_for_mime(mime_type: &str) -> &'static str {
         "audio/webm" => "webm",
         "audio/mpeg" => "mp3",
         "audio/mp4" => "m4a",
+        "video/mp4" => "mp4",
+        "video/quicktime" => "mov",
         "application/pdf" => "pdf",
         "text/plain" => "txt",
         _ => "bin",
@@ -5512,6 +6447,75 @@ fn push_event_inner(
     inner.events.push(event);
 }
 
+fn sanitize_callback(callback: &Value) -> Value {
+    let mut sanitized = callback.clone();
+    if let Some(object) = sanitized.as_object_mut() {
+        object.remove("secret");
+    }
+    sanitized
+}
+
+fn callback_subscribes_to_event(callback: &Value, event_type: &str) -> bool {
+    callback
+        .get("events")
+        .and_then(Value::as_array)
+        .is_none_or(|events| {
+            events.iter().any(|event| {
+                event
+                    .as_str()
+                    .is_some_and(|name| name == "*" || name == event_type)
+            })
+        })
+}
+
+fn compact_webhook_event(event: &crate::models::CommonEvent) -> Value {
+    json!({
+        "event_id": event.event_id,
+        "event_type": event.event_type,
+        "project_id": event.project_id,
+        "company_id": event.company_id,
+        "channel_id": event.channel_id,
+        "conversation_id": event.conversation_id,
+        "message_id": event.message_id,
+        "conversation_seq": event.conversation_seq,
+        "occurred_at": ts(event.occurred_at),
+        "payload": compact_payload(&event.payload)
+    })
+}
+
+fn compact_payload(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let mut compact = serde_json::Map::new();
+            for (key, value) in object {
+                if matches!(
+                    key.as_str(),
+                    "text" | "caption" | "bytes" | "raw_response_json" | "transcript" | "media"
+                ) {
+                    continue;
+                }
+                compact.insert(key.clone(), compact_payload(value));
+            }
+            Value::Object(compact)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(compact_payload).collect()),
+        other => other.clone(),
+    }
+}
+
+fn next_webhook_retry_at(
+    attempt: u32,
+    retry_base_seconds: u64,
+    retry_max_seconds: u64,
+) -> OffsetDateTime {
+    let exponent = attempt.saturating_sub(1).min(16);
+    let multiplier = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
+    let delay = retry_base_seconds
+        .saturating_mul(multiplier)
+        .min(retry_max_seconds.max(1));
+    OffsetDateTime::now_utc() + Duration::seconds(i64::try_from(delay).unwrap_or(i64::MAX))
+}
+
 impl DirtyRecord {
     fn updated(&mut self, now: OffsetDateTime) {
         self.available_at = self.available_at.min(now);
@@ -5730,6 +6734,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn downloaded_inbound_audio_media_is_stored_and_queues_transcription() {
+        let mut config = AppConfig::from_env();
+        config.media_local_temp_dir = std::env::temp_dir().join(format!(
+            "rustzap-inbound-media-test-{}",
+            Uuid::now_v7().simple()
+        ));
+        let state = AppState::new(config);
+        let runtime = test_runtime();
+        let message = state.receive_inbound_text(
+            "p",
+            "c",
+            SimulateInboundTextRequest {
+                conversation_id: Some("conv_downloaded_audio".to_string()),
+                channel_id: Some(runtime.channel_id.clone()),
+                from_phone_e164: Some("+15550000003".to_string()),
+                sender_name: Some("Audio Sender".to_string()),
+                profile_picture_url: None,
+                text: "voice note".to_string(),
+            },
+        );
+        let bytes = b"OggS\x00\x02rustzap-audio".to_vec();
+        let descriptor = InboundMediaDescriptor {
+            media_type: "audio".to_string(),
+            mime_type: "audio/ogg".to_string(),
+            filename: Some("voice.ogg".to_string()),
+            caption: None,
+            direct_path: "/v/t62/test".to_string(),
+            media_key_b64: String::new(),
+            file_sha256_b64: String::new(),
+            file_enc_sha256_b64: String::new(),
+            file_length: bytes.len() as u64,
+            width: None,
+            height: None,
+            duration_seconds: Some(1.5),
+        };
+
+        let media = state
+            .store_downloaded_inbound_media(
+                &runtime,
+                &message,
+                &message.conversation_id,
+                descriptor,
+                bytes.clone(),
+            )
+            .unwrap();
+
+        assert_eq!(media.message_id.as_deref(), Some(message.id.as_str()));
+        assert_eq!(media.media_type, "audio");
+        assert_eq!(media.storage_status, "temp");
+        assert_eq!(media.duration_seconds, Some(1.5));
+        let (_stored, stored_bytes) = state.media_blob(&media.id).unwrap().unwrap();
+        assert_eq!(stored_bytes, bytes);
+        let events = state.events();
+        assert!(events.iter().any(|event| {
+            event.event_type == "media.stored"
+                && event.payload["media_id"].as_str() == Some(media.id.as_str())
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "audio.transcription.requested"
+                && event.payload["media_id"].as_str() == Some(media.id.as_str())
+        }));
+    }
+
     #[tokio::test]
     async fn transcription_worker_preserves_transcript_id_when_status_changes() {
         let state = AppState::new(AppConfig::from_env());
@@ -5830,6 +6898,7 @@ mod tests {
                     push_name: Some("Raw Sender".to_string()),
                     text: Some("raw inbound".to_string()),
                     message_type: "text".to_string(),
+                    media: None,
                     created_at_wa: OffsetDateTime::now_utc(),
                     is_from_me: false,
                 },
@@ -6094,6 +7163,92 @@ mod tests {
         assert!(state.list_dirty("p", "c", "alpha", 10).is_empty());
     }
 
+    #[tokio::test]
+    async fn webhook_delivery_sends_compact_signed_events_and_records_attempt() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<(axum::http::HeaderMap, Vec<u8>)>();
+        let app = axum::Router::new().route(
+            "/hook",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                    let tx = tx.clone();
+                    async move {
+                        tx.send((headers, body.to_vec())).unwrap();
+                        axum::http::StatusCode::NO_CONTENT
+                    }
+                },
+            ),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = AppConfig::from_env();
+        config.consumer_signal_mode = crate::config::ConsumerSignalMode::Webhook;
+        config.webhook.delivery_enabled = true;
+        let state = AppState::new(config);
+        state.upsert_callback(
+            "p",
+            "c",
+            None,
+            json!({
+                "url": format!("http://{addr}/hook"),
+                "secret": "webhook_secret",
+                "events": ["conversation.dirty"],
+                "enabled": true
+            }),
+        );
+        state.receive_inbound_text(
+            "p",
+            "c",
+            SimulateInboundTextRequest {
+                conversation_id: Some("conv".to_string()),
+                channel_id: Some("ch".to_string()),
+                from_phone_e164: None,
+                sender_name: None,
+                profile_picture_url: None,
+                text: "private text must not be delivered".to_string(),
+            },
+        );
+
+        state.deliver_pending_webhooks_once().await.unwrap();
+
+        let (headers, raw_body) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        let timestamp = headers
+            .get("X-RustZap-Timestamp")
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        let signature = headers
+            .get("X-RustZap-Signature")
+            .and_then(|value| value.to_str().ok())
+            .unwrap();
+        assert_eq!(
+            signature,
+            crate::security::webhook_signature("webhook_secret", timestamp, &raw_body)
+        );
+        assert!(headers.get("X-RustZap-Event-Id").is_some());
+        let body: Value = serde_json::from_slice(&raw_body).unwrap();
+        assert_eq!(body["events"].as_array().unwrap().len(), 1);
+        assert_eq!(body["events"][0]["event_type"], "conversation.dirty");
+        assert!(
+            body.to_string()
+                .contains("private text must not be delivered")
+                == false
+        );
+
+        let attempts = state.webhook_delivery_attempts("p", "c");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0]["status"], "success");
+
+        server.abort();
+    }
+
     #[test]
     fn message_cursor_pagination_uses_after_seq_and_limit_cap() {
         let state = AppState::new(AppConfig::from_env());
@@ -6150,6 +7305,7 @@ mod tests {
                     push_name: None,
                     text: None,
                     message_type: "system".to_string(),
+                    media: None,
                     created_at_wa: OffsetDateTime::now_utc(),
                     is_from_me: false,
                 },
@@ -6181,6 +7337,7 @@ mod tests {
                     push_name: Some("Status Sender".to_string()),
                     text: Some("status caption".to_string()),
                     message_type: "image".to_string(),
+                    media: None,
                     created_at_wa: OffsetDateTime::now_utc(),
                     is_from_me: false,
                 },
@@ -6199,6 +7356,7 @@ mod tests {
                     push_name: Some("Canal".to_string()),
                     text: Some("canal update".to_string()),
                     message_type: "video".to_string(),
+                    media: None,
                     created_at_wa: OffsetDateTime::now_utc(),
                     is_from_me: false,
                 },
@@ -6393,6 +7551,7 @@ mod tests {
                     push_name: Some("João Merlin".to_string()),
                     text: Some("mensagem para outra pessoa".to_string()),
                     message_type: "text".to_string(),
+                    media: None,
                     created_at_wa: OffsetDateTime::now_utc(),
                     is_from_me: true,
                 },
@@ -6852,7 +8011,10 @@ mod tests {
 
     #[test]
     fn inbound_image_gets_rustyzap_key_and_preview_url() {
-        let state = AppState::new(AppConfig::from_env());
+        let mut config = AppConfig::from_env();
+        config.r2.bucket = "devbucket".to_string();
+        config.r2.base_prefix = "rustyzap".to_string();
+        let state = AppState::new(config);
         let (message, media, _) = state.receive_inbound_media(
             "p",
             "c",
@@ -7033,6 +8195,7 @@ mod tests {
                     push_name: Some("Old Contact".to_string()),
                     text: Some("old".to_string()),
                     message_type: "text".to_string(),
+                    media: None,
                     created_at_wa: connected_at - Duration::seconds(1),
                     is_from_me: false,
                 },

@@ -30,6 +30,7 @@ import {
 } from "@/lib/rustzap-api";
 import type {
   ApiMode,
+  CapabilityKey,
   GroupMember,
   MediaType,
   Message,
@@ -94,6 +95,19 @@ function updateConversationForMessage(state: RustZapState, conversationId: strin
 
 function coerceObject(body: unknown) {
   return body && typeof body === "object" && !Array.isArray(body) ? (body as Record<string, unknown>) : {};
+}
+
+function coerceCapabilities(body: unknown, current: Record<CapabilityKey, boolean>) {
+  const root = coerceObject(body);
+  const features = coerceObject(root.features);
+  return (Object.keys(current) as CapabilityKey[]).reduce(
+    (next, key) => {
+      const feature = coerceObject(features[key]);
+      next[key] = typeof feature.supported === "boolean" ? feature.supported : current[key];
+      return next;
+    },
+    { ...current }
+  );
 }
 
 export function RustZapProvider({ children }: { children: ReactNode }) {
@@ -249,6 +263,18 @@ export function RustZapProvider({ children }: { children: ReactNode }) {
         }
       }));
     }
+    const capabilities = await runReal(
+      "channel.capabilities",
+      "GET",
+      tenantPath(`/channels/whatsapp/accounts/${DEFAULT_CHANNEL_ID}/capabilities`)
+    );
+    setState((current) => ({
+      ...current,
+      channel: {
+        ...current.channel,
+        capabilities: coerceCapabilities(capabilities?.body, current.channel.capabilities)
+      }
+    }));
     await runReal("conversations.list", "GET", tenantPath("/conversations"));
     await runReal("groups.list", "GET", tenantPath("/groups"));
   }, [addEvent, runReal, state.mode]);
@@ -640,6 +666,13 @@ export function RustZapProvider({ children }: { children: ReactNode }) {
 
   const togglePin = useCallback(
     async (messageId: string) => {
+      if (!state.channel.capabilities.pin_message) {
+        addEvent("tester.command.disabled", {
+          command: "pin_message",
+          message_id: messageId
+        });
+        return;
+      }
       const message = state.messages.find((item) => item.id === messageId);
       if (state.mode === "real") {
         await runReal(
@@ -657,11 +690,18 @@ export function RustZapProvider({ children }: { children: ReactNode }) {
       }));
       addEvent("message.pinned", { message_id: messageId, pinned: !message?.isPinned });
     },
-    [addEvent, runReal, state.messages, state.mode]
+    [addEvent, runReal, state.channel.capabilities.pin_message, state.messages, state.mode]
   );
 
   const toggleStar = useCallback(
     async (messageId: string) => {
+      if (!state.channel.capabilities.star_message) {
+        addEvent("tester.command.disabled", {
+          command: "star_message",
+          message_id: messageId
+        });
+        return;
+      }
       const message = state.messages.find((item) => item.id === messageId);
       if (state.mode === "real") {
         await runReal(
@@ -679,7 +719,7 @@ export function RustZapProvider({ children }: { children: ReactNode }) {
       }));
       addEvent("message.starred", { message_id: messageId, starred: !message?.isStarred });
     },
-    [addEvent, runReal, state.messages, state.mode]
+    [addEvent, runReal, state.channel.capabilities.star_message, state.messages, state.mode]
   );
 
   const markConversationRead = useCallback(

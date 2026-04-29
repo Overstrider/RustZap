@@ -3,21 +3,24 @@ use std::collections::{HashMap, HashSet};
 use axum::{
     Json, Router,
     extract::{
-        Multipart, Path, Query, State, WebSocketUpgrade,
+        Multipart, Path, Query, Request, State, WebSocketUpgrade,
         ws::{Message as WsMessage, WebSocket},
     },
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Response},
     routing::{delete, get, patch, post},
 };
 use serde::Serialize;
 use serde_json::{Value, json};
+use time::OffsetDateTime;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 use crate::{
     config::{EventBusMode, MetadataDbMode},
     error::{ApiError, ApiResult},
     eventbus,
+    media::{R2ObjectKeyInput, r2_object_key},
     models::{
         ChannelAccountRequest, CompanyRequest, DirtyAckRequest, DirtyListResponse, PageQuery,
         ProjectCompanyChannelPath, ProjectCompanyContactPath, ProjectCompanyConversationPath,
@@ -30,8 +33,8 @@ use crate::{
         Principal, authorize, authorize_company, authorize_project, authorize_token,
         generate_api_key, idempotency_key, register_project_api_key,
     },
-    state::{AppState, OutboundMediaUpload},
-    storage::presigned_r2_get_url,
+    state::{AppState, OutboundMediaUpload, RateLimitScope},
+    storage::{copy_r2_object, delete_r2_object, presigned_r2_get_url},
     whatsapp,
 };
 
@@ -285,7 +288,25 @@ pub fn build_router(state: AppState) -> Router {
         )
         .with_state(state)
         .layer(CorsLayer::permissive())
+        .layer(middleware::from_fn(request_id_middleware))
         .layer(TraceLayer::new_for_http())
+}
+
+async fn request_id_middleware(request: Request, next: Next) -> Response {
+    let request_id = request
+        .headers()
+        .get("X-Request-Id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(crate::error::new_request_id);
+    let mut response = crate::error::scope_request_id(request_id.clone(), next.run(request)).await;
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert("X-Request-Id", value.clone());
+        response.headers_mut().insert("X-Correlation-Id", value);
+    }
+    response
 }
 
 async fn health() -> Json<Value> {
@@ -339,13 +360,19 @@ async fn ready(State(state): State<AppState>) -> Json<ReadyResponse> {
 
 async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
     let event_bus = state.event_bus_snapshot();
+    let runtime = state.runtime_metrics_snapshot();
     format!(
-        "rustzap_up 1\nrustzap_eventbus_publish_attempts {}\nrustzap_eventbus_publish_successes {}\nrustzap_eventbus_publish_failures {}\nrustzap_eventbus_deadletter_attempts {}\nrustzap_eventbus_deadletter_successes {}\n",
+        "rustzap_up 1\nrustzap_eventbus_publish_attempts {}\nrustzap_eventbus_publish_successes {}\nrustzap_eventbus_publish_failures {}\nrustzap_eventbus_deadletter_attempts {}\nrustzap_eventbus_deadletter_successes {}\nrustzap_rate_limited_total {}\nrustzap_webhook_delivery_attempts_total {}\nrustzap_webhook_delivery_successes_total {}\nrustzap_stt_requests_total {}\nrustzap_websocket_subscriptions_total {}\n",
         event_bus.publish_attempts,
         event_bus.publish_successes,
         event_bus.publish_failures,
         event_bus.deadletter_attempts,
-        event_bus.deadletter_successes
+        event_bus.deadletter_successes,
+        runtime.rate_limited_total,
+        runtime.webhook_delivery_attempts_total,
+        runtime.webhook_delivery_successes_total,
+        runtime.stt_requests_total,
+        runtime.websocket_subscriptions_total
     )
 }
 
@@ -356,7 +383,7 @@ async fn docs() -> Html<&'static str> {
 }
 
 async fn openapi_json() -> Json<Value> {
-    Json(json!({
+    let mut spec = json!({
         "openapi": "3.1.0",
         "info": {"title": "RustZap", "version": "0.1.0"},
         "components": {
@@ -506,7 +533,207 @@ async fn openapi_json() -> Json<Value> {
                 "post": {"summary": "Anonymize contact privacy data"}
             }
         }
-    }))
+    });
+    if let Some(paths) = spec.get_mut("paths").and_then(Value::as_object_mut) {
+        add_openapi_paths(paths);
+    }
+    Json(spec)
+}
+
+fn add_openapi_paths(paths: &mut serde_json::Map<String, Value>) {
+    for (path, methods) in [
+        (
+            "/metrics",
+            json!({"get": {"summary": "Prometheus metrics"}}),
+        ),
+        ("/docs", json!({"get": {"summary": "API docs"}})),
+        (
+            "/debug/kafka",
+            json!({"get": {"summary": "Kafka debug", "security": [{"bearerAuth": ["admin:*"]}]}}),
+        ),
+        (
+            "/debug/kafka/deadletters",
+            json!({"get": {"summary": "List Kafka deadletters", "security": [{"bearerAuth": ["admin:*"]}]}}),
+        ),
+        (
+            "/debug/kafka/deadletters/{deadletter_id}/replay",
+            json!({"post": {"summary": "Replay Kafka deadletter", "security": [{"bearerAuth": ["admin:*"]}]}}),
+        ),
+        (
+            "/debug/dirty",
+            json!({"get": {"summary": "Debug dirty events", "security": [{"bearerAuth": ["admin:*"]}]}}),
+        ),
+        (
+            "/debug/channels",
+            json!({"get": {"summary": "Debug channels", "security": [{"bearerAuth": ["admin:*"]}]}}),
+        ),
+        (
+            "/dev-media/{media_id}",
+            json!({"get": {"summary": "Development media preview"}}),
+        ),
+        (
+            "/v1/projects",
+            json!({"post": {"summary": "Create project", "security": [{"bearerAuth": ["projects:write"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/api-keys",
+            json!({"post": {"summary": "Create API key", "security": [{"bearerAuth": ["projects:write"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies",
+            json!({"post": {"summary": "Create company", "security": [{"bearerAuth": ["companies:write"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}",
+            json!({"get": {"summary": "Get company", "security": [{"bearerAuth": ["companies:read"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/channels/whatsapp/accounts",
+            json!({"post": {"summary": "Create WhatsApp account", "security": [{"bearerAuth": ["channels:write"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/channels/whatsapp/accounts/{channel_id}",
+            json!({"get": {"summary": "Get WhatsApp account", "security": [{"bearerAuth": ["channels:read"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/connect",
+            json!({"post": {"summary": "Connect WhatsApp account", "security": [{"bearerAuth": ["channels:write"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/disconnect",
+            json!({"post": {"summary": "Disconnect WhatsApp account", "security": [{"bearerAuth": ["channels:write"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/qr",
+            json!({"get": {"summary": "Get WhatsApp QR", "security": [{"bearerAuth": ["channels:read"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/pair-code",
+            json!({"post": {"summary": "Request pair code", "security": [{"bearerAuth": ["channels:write"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/capabilities",
+            json!({"get": {"summary": "Get channel capabilities", "security": [{"bearerAuth": ["channels:read"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/contacts/by-phone/{phone_e164}",
+            json!({"get": {"summary": "Get contact by phone", "security": [{"bearerAuth": ["contacts:read"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/conversations/{conversation_id}",
+            json!({"get": {"summary": "Get conversation", "security": [{"bearerAuth": ["conversations:read"]}]}, "patch": {"summary": "Patch conversation", "security": [{"bearerAuth": ["conversations:read"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/conversations/{conversation_id}/mark-read",
+            json!({"post": {"summary": "Mark conversation read", "security": [{"bearerAuth": ["messages:manage"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/conversations/{conversation_id}/typing",
+            json!({"post": {"summary": "Send typing state", "security": [{"bearerAuth": ["messages:send"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/messages/{message_id}",
+            json!({"get": {"summary": "Get message", "security": [{"bearerAuth": ["messages:read"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/messages/{message_id}/react",
+            json!({"post": {"summary": "React to message", "security": [{"bearerAuth": ["messages:manage"]}]}, "delete": {"summary": "Delete reaction", "security": [{"bearerAuth": ["messages:manage"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/messages/{message_id}/pin",
+            json!({"post": {"summary": "Pin message", "security": [{"bearerAuth": ["messages:manage"]}]}, "delete": {"summary": "Unpin message", "security": [{"bearerAuth": ["messages:manage"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/messages/{message_id}/star",
+            json!({"post": {"summary": "Star message", "security": [{"bearerAuth": ["messages:manage"]}]}, "delete": {"summary": "Unstar message", "security": [{"bearerAuth": ["messages:manage"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/media/upload-outbound",
+            json!({"post": {"summary": "Upload outbound media", "security": [{"bearerAuth": ["media:write"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/media/{media_id}",
+            json!({"get": {"summary": "Get media", "security": [{"bearerAuth": ["media:read"]}]}, "delete": {"summary": "Delete media", "security": [{"bearerAuth": ["media:write"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/media/{media_id}/download-url",
+            json!({"get": {"summary": "Get media download URL", "security": [{"bearerAuth": ["media:read"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/media/{media_id}/save",
+            json!({"post": {"summary": "Save media permanently", "security": [{"bearerAuth": ["media:write"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/messages/{message_id}/transcript",
+            json!({"get": {"summary": "Get transcript", "security": [{"bearerAuth": ["transcripts:read"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/messages/{message_id}/transcribe",
+            json!({"post": {"summary": "Request transcription", "security": [{"bearerAuth": ["transcripts:write"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/exit",
+            json!({"post": {"summary": "Exit group", "security": [{"bearerAuth": ["groups:manage"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/members/{contact_id}",
+            json!({"delete": {"summary": "Remove group member", "security": [{"bearerAuth": ["groups:manage"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/members/{contact_id}/promote",
+            json!({"post": {"summary": "Promote group member", "security": [{"bearerAuth": ["groups:manage"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/members/{contact_id}/demote",
+            json!({"post": {"summary": "Demote group member", "security": [{"bearerAuth": ["groups:manage"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/join-requests/{request_id}/accept",
+            json!({"post": {"summary": "Accept join request", "security": [{"bearerAuth": ["groups:manage"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/join-requests/{request_id}/reject",
+            json!({"post": {"summary": "Reject join request", "security": [{"bearerAuth": ["groups:manage"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/dirty-conversations/{conversation_id}/ack",
+            json!({"post": {"summary": "Ack dirty conversation", "security": [{"bearerAuth": ["dirty:ack"]}]}}),
+        ),
+        (
+            "/v1/projects/{project_id}/companies/{company_id}/consumer-callbacks/{callback_id}",
+            json!({"patch": {"summary": "Update callback", "security": [{"bearerAuth": ["admin:*"]}]}, "delete": {"summary": "Delete callback", "security": [{"bearerAuth": ["admin:*"]}]}}),
+        ),
+        (
+            "/v1/dev/projects/{project_id}/companies/{company_id}/simulate/inbound-text",
+            json!({"post": {"summary": "Simulate inbound text", "security": [{"bearerAuth": ["dev:simulate"]}]}}),
+        ),
+        (
+            "/v1/dev/projects/{project_id}/companies/{company_id}/simulate/inbound-audio",
+            json!({"post": {"summary": "Simulate inbound audio", "security": [{"bearerAuth": ["dev:simulate"]}]}}),
+        ),
+        (
+            "/v1/dev/projects/{project_id}/companies/{company_id}/simulate/inbound-image",
+            json!({"post": {"summary": "Simulate inbound image", "security": [{"bearerAuth": ["dev:simulate"]}]}}),
+        ),
+        (
+            "/v1/dev/projects/{project_id}/companies/{company_id}/simulate/receipt",
+            json!({"post": {"summary": "Simulate receipt", "security": [{"bearerAuth": ["dev:simulate"]}]}}),
+        ),
+        (
+            "/v1/dev/projects/{project_id}/companies/{company_id}/simulate/qr-rotate",
+            json!({"post": {"summary": "Rotate dev QR", "security": [{"bearerAuth": ["dev:simulate"]}]}}),
+        ),
+        (
+            "/v1/dev/projects/{project_id}/companies/{company_id}/simulate/group-event",
+            json!({"post": {"summary": "Simulate group event", "security": [{"bearerAuth": ["dev:simulate"]}]}}),
+        ),
+        (
+            "/v1/dev/projects/{project_id}/companies/{company_id}/simulate/reset",
+            json!({"post": {"summary": "Reset dev state", "security": [{"bearerAuth": ["dev:simulate"]}]}}),
+        ),
+    ] {
+        paths.entry(path.to_string()).or_insert(methods);
+    }
 }
 
 fn paginated_items<T>(items: Vec<T>, query: &PageQuery) -> ApiResult<Value>
@@ -1084,13 +1311,34 @@ async fn send_message(
     State(state): State<AppState>,
     Json(req): Json<SendMessageRequest>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    authorize_company(
+    let principal = authorize_company(
         &state.config,
         &headers,
         "messages:send",
         &path.project_id,
         &path.company_id,
     )?;
+    state.enforce_rate_limit(RateLimitScope {
+        headers: &headers,
+        api_key_id: &principal.api_key_id,
+        project_id: Some(&path.project_id),
+        company_id: Some(&path.company_id),
+        family: "messages:send",
+        resource_id: Some(&path.conversation_id),
+        max_per_minute: state
+            .config
+            .rate_limits
+            .send_message_per_minute_per_conversation,
+    })?;
+    state.enforce_rate_limit(RateLimitScope {
+        headers: &headers,
+        api_key_id: &principal.api_key_id,
+        project_id: Some(&path.project_id),
+        company_id: Some(&path.company_id),
+        family: "messages:send:tenant",
+        resource_id: None,
+        max_per_minute: state.config.rate_limits.send_message_per_minute_per_channel,
+    })?;
     let idempotency_key = idempotency_key(&headers)?;
     let outcome = state.prepare_send_message(
         &path.project_id,
@@ -1361,13 +1609,25 @@ async fn upload_outbound(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> ApiResult<Json<Value>> {
-    authorize_company(
+    let principal = authorize_company(
         &state.config,
         &headers,
         "media:write",
         &path.project_id,
         &path.company_id,
     )?;
+    state.enforce_rate_limit(RateLimitScope {
+        headers: &headers,
+        api_key_id: &principal.api_key_id,
+        project_id: Some(&path.project_id),
+        company_id: Some(&path.company_id),
+        family: "media:upload",
+        resource_id: None,
+        max_per_minute: state
+            .config
+            .rate_limits
+            .media_downloads_per_minute_per_channel,
+    })?;
     let mut conversation_id = None;
     let mut media_type = None;
     let mut mime_type = None;
@@ -1486,13 +1746,25 @@ async fn get_media(
     Path(path): Path<ProjectCompanyMediaPath>,
     State(state): State<AppState>,
 ) -> ApiResult<Json<Value>> {
-    authorize_company(
+    let principal = authorize_company(
         &state.config,
         &headers,
         "media:read",
         &path.project_id,
         &path.company_id,
     )?;
+    state.enforce_rate_limit(RateLimitScope {
+        headers: &headers,
+        api_key_id: &principal.api_key_id,
+        project_id: Some(&path.project_id),
+        company_id: Some(&path.company_id),
+        family: "media:download",
+        resource_id: Some(&path.media_id),
+        max_per_minute: state
+            .config
+            .rate_limits
+            .media_downloads_per_minute_per_channel,
+    })?;
     Ok(Json(json!(state.media_for_company(
         &path.project_id,
         &path.company_id,
@@ -1560,13 +1832,42 @@ async fn save_media(
         .get("entity_id")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-    Ok(Json(json!(state.save_media_for_company(
-        &path.project_id,
-        &path.company_id,
-        &path.media_id,
-        entity_type,
-        entity_id
-    )?)))
+    let before = state.media_for_company(&path.project_id, &path.company_id, &path.media_id)?;
+    let media = if let Some(source) = before.object_key.as_deref() {
+        let destination = r2_object_key(R2ObjectKeyInput {
+            base_prefix: &state.config.r2.base_prefix,
+            class: "permanent",
+            project_id: &before.project_id,
+            company_id: &before.company_id,
+            channel_id: "channel_dev",
+            conversation_id: Some(&before.conversation_id),
+            entity_type: Some(entity_type),
+            entity_id: Some(entity_id),
+            date: OffsetDateTime::now_utc().date(),
+            media_id: &path.media_id,
+            ext: "bin",
+        });
+        copy_r2_object(&state.config.r2, source, &destination)
+            .await
+            .map_err(ApiError::ProviderError)?;
+        state.save_media_with_permanent_object_key_for_company(
+            &path.project_id,
+            &path.company_id,
+            &path.media_id,
+            entity_type,
+            entity_id,
+            destination,
+        )?
+    } else {
+        state.save_media_for_company(
+            &path.project_id,
+            &path.company_id,
+            &path.media_id,
+            entity_type,
+            entity_id,
+        )?
+    };
+    Ok(Json(json!(media)))
 }
 
 async fn delete_media(
@@ -1581,8 +1882,22 @@ async fn delete_media(
         &path.project_id,
         &path.company_id,
     )?;
-    state.media_for_company(&path.project_id, &path.company_id, &path.media_id)?;
-    Ok(Json(json!({"media_id": path.media_id, "deleted": true})))
+    let before = state.media_for_company(&path.project_id, &path.company_id, &path.media_id)?;
+    if let Some(object_key) = before.object_key.as_deref() {
+        delete_r2_object(&state.config.r2, object_key)
+            .await
+            .map_err(ApiError::ProviderError)?;
+    }
+    if let Some(object_key) = before.permanent_object_key.as_deref() {
+        delete_r2_object(&state.config.r2, object_key)
+            .await
+            .map_err(ApiError::ProviderError)?;
+    }
+    let media =
+        state.delete_media_for_company(&path.project_id, &path.company_id, &path.media_id)?;
+    Ok(Json(
+        json!({"media_id": path.media_id, "deleted": true, "media": media}),
+    ))
 }
 
 async fn get_transcript(
@@ -1606,13 +1921,22 @@ async fn transcribe_message(
     Path(path): Path<ProjectCompanyMessagePath>,
     State(state): State<AppState>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
-    authorize_company(
+    let principal = authorize_company(
         &state.config,
         &headers,
         "transcripts:write",
         &path.project_id,
         &path.company_id,
     )?;
+    state.enforce_rate_limit(RateLimitScope {
+        headers: &headers,
+        api_key_id: &principal.api_key_id,
+        project_id: Some(&path.project_id),
+        company_id: Some(&path.company_id),
+        family: "stt",
+        resource_id: Some(&path.message_id),
+        max_per_minute: state.config.rate_limits.stt_per_minute_per_project,
+    })?;
     state.message_for_company(&path.project_id, &path.company_id, &path.message_id)?;
     let transcript =
         state.request_transcript(&path.project_id, &path.company_id, &path.message_id)?;
@@ -1938,10 +2262,17 @@ async fn list_callbacks(
     Path(path): Path<ProjectCompanyPath>,
     State(state): State<AppState>,
 ) -> ApiResult<Json<Value>> {
-    authorize_company(
+    let principal = authorize_company(
         &state.config,
         &headers,
         "admin:*",
+        &path.project_id,
+        &path.company_id,
+    )?;
+    enforce_admin_rate_limit(
+        &state,
+        &headers,
+        &principal.api_key_id,
         &path.project_id,
         &path.company_id,
     )?;
@@ -1956,10 +2287,17 @@ async fn create_callback(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> ApiResult<Json<Value>> {
-    authorize_company(
+    let principal = authorize_company(
         &state.config,
         &headers,
         "admin:*",
+        &path.project_id,
+        &path.company_id,
+    )?;
+    enforce_admin_rate_limit(
+        &state,
+        &headers,
+        &principal.api_key_id,
         &path.project_id,
         &path.company_id,
     )?;
@@ -1978,7 +2316,15 @@ async fn update_callback(
     Json(body): Json<Value>,
 ) -> ApiResult<Json<Value>> {
     let (project_id, company_id, callback_id) = path;
-    authorize_company(&state.config, &headers, "admin:*", &project_id, &company_id)?;
+    let principal =
+        authorize_company(&state.config, &headers, "admin:*", &project_id, &company_id)?;
+    enforce_admin_rate_limit(
+        &state,
+        &headers,
+        &principal.api_key_id,
+        &project_id,
+        &company_id,
+    )?;
     Ok(Json(state.upsert_callback(
         &project_id,
         &company_id,
@@ -1993,7 +2339,15 @@ async fn delete_callback(
     State(state): State<AppState>,
 ) -> ApiResult<Json<Value>> {
     let (project_id, company_id, callback_id) = path;
-    authorize_company(&state.config, &headers, "admin:*", &project_id, &company_id)?;
+    let principal =
+        authorize_company(&state.config, &headers, "admin:*", &project_id, &company_id)?;
+    enforce_admin_rate_limit(
+        &state,
+        &headers,
+        &principal.api_key_id,
+        &project_id,
+        &company_id,
+    )?;
     Ok(Json(state.delete_callback(
         &project_id,
         &company_id,
@@ -2006,10 +2360,17 @@ async fn privacy_export(
     Path(path): Path<ProjectCompanyContactPath>,
     State(state): State<AppState>,
 ) -> ApiResult<Json<Value>> {
-    authorize_company(
+    let principal = authorize_company(
         &state.config,
         &headers,
         "admin:*",
+        &path.project_id,
+        &path.company_id,
+    )?;
+    enforce_admin_rate_limit(
+        &state,
+        &headers,
+        &principal.api_key_id,
         &path.project_id,
         &path.company_id,
     )?;
@@ -2031,10 +2392,17 @@ async fn privacy_delete(
     Path(path): Path<ProjectCompanyContactPath>,
     State(state): State<AppState>,
 ) -> ApiResult<Json<Value>> {
-    authorize_company(
+    let principal = authorize_company(
         &state.config,
         &headers,
         "admin:*",
+        &path.project_id,
+        &path.company_id,
+    )?;
+    enforce_admin_rate_limit(
+        &state,
+        &headers,
+        &principal.api_key_id,
         &path.project_id,
         &path.company_id,
     )?;
@@ -2051,10 +2419,17 @@ async fn privacy_anonymize(
     Path(path): Path<ProjectCompanyContactPath>,
     State(state): State<AppState>,
 ) -> ApiResult<Json<Value>> {
-    authorize_company(
+    let principal = authorize_company(
         &state.config,
         &headers,
         "admin:*",
+        &path.project_id,
+        &path.company_id,
+    )?;
+    enforce_admin_rate_limit(
+        &state,
+        &headers,
+        &principal.api_key_id,
         &path.project_id,
         &path.company_id,
     )?;
@@ -2275,13 +2650,19 @@ async fn websocket_session(mut socket: WebSocket, state: AppState, principal: Pr
                 match message {
                     WsMessage::Text(text) => {
                         let response = match serde_json::from_str::<SubscribeRequest>(&text) {
-                            Ok(sub) if sub.kind == "subscribe" && sub.topics.len() <= 1000 => {
+                            Ok(sub)
+                                if sub.kind == "subscribe"
+                                    && sub.topics.len()
+                                        <= state.config.rate_limits.ws_subscriptions_per_connection
+                                            as usize =>
+                            {
                                 match crate::security::enforce_principal_tenant(
                                     &principal,
                                     &sub.project_id,
                                     Some(&sub.company_id),
                                 ) {
                                     Ok(()) => {
+                                        state.record_websocket_subscription_metric();
                                         subscribed_tenant = Some((
                                             sub.project_id.clone(),
                                             sub.company_id.clone(),
@@ -2387,6 +2768,24 @@ fn websocket_error(err: ApiError) -> Value {
     })
 }
 
+fn enforce_admin_rate_limit(
+    state: &AppState,
+    headers: &HeaderMap,
+    api_key_id: &str,
+    project_id: &str,
+    company_id: &str,
+) -> ApiResult<()> {
+    state.enforce_rate_limit(RateLimitScope {
+        headers,
+        api_key_id,
+        project_id: Some(project_id),
+        company_id: Some(company_id),
+        family: "admin",
+        resource_id: None,
+        max_per_minute: state.config.rate_limits.admin_requests_per_minute,
+    })
+}
+
 fn ensure_dev(state: &AppState) -> ApiResult<()> {
     if state.config.dev_mode && state.config.dev_simulation_enabled {
         Ok(())
@@ -2472,6 +2871,100 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn error_request_id_matches_response_header() {
+        let app = build_router(AppState::new(crate::config::AppConfig::from_env()));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/projects/p/companies/c/conversations")
+                    .header("X-Request-Id", "req_test_123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let header = res
+            .headers()
+            .get("X-Request-Id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(header.as_deref(), Some("req_test_123"));
+        assert_eq!(parsed["error"]["request_id"], "req_test_123");
+    }
+
+    #[tokio::test]
+    async fn send_message_rate_limit_returns_standard_error() {
+        let mut config = crate::config::AppConfig::from_env();
+        config.rate_limits.send_message_per_minute_per_conversation = 1;
+        config.rate_limits.send_message_per_minute_per_channel = 1;
+        let app = build_router(AppState::new(config));
+
+        for idem in ["rate-limit-1", "rate-limit-2"] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/projects/p/companies/c/conversations/conv/messages")
+                        .header("Authorization", "Bearer dev_project_key")
+                        .header("Idempotency-Key", idem)
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"type":"text","text":"oi"}"#))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            if idem == "rate-limit-1" {
+                assert_eq!(res.status(), StatusCode::ACCEPTED);
+            } else {
+                assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+                let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+                let parsed: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(parsed["error"]["code"], "rate_limited");
+                assert!(parsed["error"]["request_id"].as_str().is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn openapi_lists_critical_registered_routes() {
+        let app = build_router(AppState::new(crate::config::AppConfig::from_env()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let spec: Value = serde_json::from_slice(&body).unwrap();
+        let paths = spec["paths"].as_object().unwrap();
+
+        for path in [
+            "/metrics",
+            "/v1/projects",
+            "/v1/projects/{project_id}/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/capabilities",
+            "/v1/projects/{project_id}/companies/{company_id}/media/upload-outbound",
+            "/v1/projects/{project_id}/companies/{company_id}/media/{media_id}/download-url",
+            "/v1/projects/{project_id}/companies/{company_id}/messages/{message_id}/transcribe",
+            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/exit",
+            "/v1/projects/{project_id}/companies/{company_id}/dirty-conversations/{conversation_id}/ack",
+            "/v1/dev/projects/{project_id}/companies/{company_id}/simulate/inbound-audio",
+        ] {
+            assert!(paths.contains_key(path), "OpenAPI missing {path}");
+        }
     }
 
     #[tokio::test]

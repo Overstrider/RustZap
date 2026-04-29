@@ -4,6 +4,7 @@ pub mod error;
 pub mod eventbus;
 pub mod media;
 pub mod models;
+pub mod rate_limit;
 pub mod routes;
 pub mod security;
 pub mod state;

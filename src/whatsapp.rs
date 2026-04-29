@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
+    io::{Seek, Write},
     path::PathBuf,
     str::FromStr,
     sync::{Arc, Mutex},
@@ -8,6 +9,7 @@ use std::{
 
 use crate::models::{CapabilitiesResponse, FeatureCapability};
 use anyhow::{Context, Result, anyhow};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
 use wacore::{
@@ -97,9 +99,38 @@ pub fn capabilities() -> CapabilitiesResponse {
         },
     );
     features.insert("groups_read".to_string(), supported());
-    features.insert("group_invite_accept".to_string(), supported_with_admin());
-    features.insert("group_member_promote".to_string(), supported_with_admin());
-    features.insert("group_member_demote".to_string(), supported_with_admin());
+    features.insert(
+        "group_exit".to_string(),
+        unsupported_group_admin("group exit"),
+    );
+    features.insert(
+        "group_member_add".to_string(),
+        unsupported_group_admin("group member add"),
+    );
+    features.insert(
+        "group_member_remove".to_string(),
+        unsupported_group_admin("group member remove"),
+    );
+    features.insert(
+        "group_invite_accept".to_string(),
+        unsupported_group_admin("group invite accept"),
+    );
+    features.insert(
+        "group_member_promote".to_string(),
+        unsupported_group_admin("group member promote"),
+    );
+    features.insert(
+        "group_member_demote".to_string(),
+        unsupported_group_admin("group member demote"),
+    );
+    features.insert(
+        "group_join_request_accept".to_string(),
+        unsupported_group_admin("group join request accept"),
+    );
+    features.insert(
+        "group_join_request_reject".to_string(),
+        unsupported_group_admin("group join request reject"),
+    );
 
     CapabilitiesResponse {
         provider: "whatsapp-rust".to_string(),
@@ -164,6 +195,22 @@ pub struct OutboundMediaMessage {
     pub ptt: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InboundMediaDescriptor {
+    pub media_type: String,
+    pub mime_type: String,
+    pub filename: Option<String>,
+    pub caption: Option<String>,
+    pub direct_path: String,
+    pub media_key_b64: String,
+    pub file_sha256_b64: String,
+    pub file_enc_sha256_b64: String,
+    pub file_length: u64,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub duration_seconds: Option<f64>,
+}
+
 #[derive(Clone, Default)]
 pub struct WhatsappManager {
     supervisors: Arc<Mutex<HashMap<String, ChannelSupervisor>>>,
@@ -196,6 +243,7 @@ pub enum WhatsappEvent {
         push_name: Option<String>,
         text: Option<String>,
         message_type: String,
+        media: Option<Box<InboundMediaDescriptor>>,
         created_at_wa: OffsetDateTime,
         is_from_me: bool,
     },
@@ -433,6 +481,45 @@ impl WhatsappManager {
             _ => unreachable!("wa_media_type is constrained above"),
         };
         client.send_message(to, message).await
+    }
+
+    pub async fn download_inbound_media_to_writer<W>(
+        &self,
+        channel_id: &str,
+        descriptor: &InboundMediaDescriptor,
+        writer: W,
+    ) -> Result<W>
+    where
+        W: Write + Seek + Send + 'static,
+    {
+        let client = self.active_client(channel_id)?;
+        let media_type = match descriptor.media_type.as_str() {
+            "image" => MediaType::Image,
+            "audio" => MediaType::Audio,
+            "document" => MediaType::Document,
+            "video" => MediaType::Video,
+            other => return Err(anyhow!("unsupported inbound media type {other}")),
+        };
+        let media_key = BASE64
+            .decode(&descriptor.media_key_b64)
+            .context("invalid inbound media_key")?;
+        let file_sha256 = BASE64
+            .decode(&descriptor.file_sha256_b64)
+            .context("invalid inbound file_sha256")?;
+        let file_enc_sha256 = BASE64
+            .decode(&descriptor.file_enc_sha256_b64)
+            .context("invalid inbound file_enc_sha256")?;
+        client
+            .download_from_params_to_writer(
+                &descriptor.direct_path,
+                &media_key,
+                &file_sha256,
+                &file_enc_sha256,
+                descriptor.file_length,
+                media_type,
+                writer,
+            )
+            .await
     }
 
     pub async fn send_reaction(
@@ -690,10 +777,12 @@ fn supported() -> FeatureCapability {
     }
 }
 
-fn supported_with_admin() -> FeatureCapability {
+fn unsupported_group_admin(command: &str) -> FeatureCapability {
     FeatureCapability {
-        supported: true,
-        reason: None,
+        supported: false,
+        reason: Some(format!(
+            "{command} is not implemented by the active adapter"
+        )),
         requires_admin: Some(true),
         guaranteed: None,
     }
@@ -803,6 +892,7 @@ fn map_message_event(message: wa::Message, info: MessageInfo) -> WhatsappEvent {
         .map(str::to_string)
         .or_else(|| message.get_caption().map(str::to_string));
     let message_type = whatsapp_message_type(&message, text.as_deref());
+    let media = inbound_media_descriptor(&message, &message_type);
     WhatsappEvent::Message {
         wa_message_id: info.id.to_string(),
         chat_jid: info.source.chat.to_string(),
@@ -813,9 +903,121 @@ fn map_message_event(message: wa::Message, info: MessageInfo) -> WhatsappEvent {
         push_name: (!info.push_name.is_empty()).then_some(info.push_name),
         text,
         message_type,
+        media: media.map(Box::new),
         created_at_wa: offset_from_unix(info.timestamp.timestamp()),
         is_from_me: info.source.is_from_me,
     }
+}
+
+fn inbound_media_descriptor(
+    message: &wa::Message,
+    message_type: &str,
+) -> Option<InboundMediaDescriptor> {
+    match message_type {
+        "image" => {
+            let image = message.image_message.as_ref()?;
+            downloadable_media_descriptor(
+                "image",
+                image.mimetype.as_deref().unwrap_or("image/jpeg"),
+                None,
+                image.caption.clone(),
+                image.direct_path.clone(),
+                image.media_key.clone(),
+                image.file_sha256.clone(),
+                image.file_enc_sha256.clone(),
+                image.file_length,
+                image.width,
+                image.height,
+                None,
+            )
+        }
+        "audio" => {
+            let audio = message.audio_message.as_ref()?;
+            downloadable_media_descriptor(
+                "audio",
+                audio.mimetype.as_deref().unwrap_or("audio/ogg"),
+                None,
+                None,
+                audio.direct_path.clone(),
+                audio.media_key.clone(),
+                audio.file_sha256.clone(),
+                audio.file_enc_sha256.clone(),
+                audio.file_length,
+                None,
+                None,
+                audio.seconds.map(f64::from),
+            )
+        }
+        "document" => {
+            let document = message.document_message.as_ref()?;
+            downloadable_media_descriptor(
+                "document",
+                document
+                    .mimetype
+                    .as_deref()
+                    .unwrap_or("application/octet-stream"),
+                document.file_name.clone().or(document.title.clone()),
+                document.caption.clone(),
+                document.direct_path.clone(),
+                document.media_key.clone(),
+                document.file_sha256.clone(),
+                document.file_enc_sha256.clone(),
+                document.file_length,
+                None,
+                None,
+                None,
+            )
+        }
+        "video" => {
+            let video = message.video_message.as_ref()?;
+            downloadable_media_descriptor(
+                "video",
+                video.mimetype.as_deref().unwrap_or("video/mp4"),
+                None,
+                video.caption.clone(),
+                video.direct_path.clone(),
+                video.media_key.clone(),
+                video.file_sha256.clone(),
+                video.file_enc_sha256.clone(),
+                video.file_length,
+                video.width,
+                video.height,
+                video.seconds.map(f64::from),
+            )
+        }
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn downloadable_media_descriptor(
+    media_type: &str,
+    mime_type: &str,
+    filename: Option<String>,
+    caption: Option<String>,
+    direct_path: Option<String>,
+    media_key: Option<Vec<u8>>,
+    file_sha256: Option<Vec<u8>>,
+    file_enc_sha256: Option<Vec<u8>>,
+    file_length: Option<u64>,
+    width: Option<u32>,
+    height: Option<u32>,
+    duration_seconds: Option<f64>,
+) -> Option<InboundMediaDescriptor> {
+    Some(InboundMediaDescriptor {
+        media_type: media_type.to_string(),
+        mime_type: mime_type.to_string(),
+        filename,
+        caption,
+        direct_path: direct_path?,
+        media_key_b64: BASE64.encode(media_key?),
+        file_sha256_b64: BASE64.encode(file_sha256?),
+        file_enc_sha256_b64: BASE64.encode(file_enc_sha256?),
+        file_length: file_length?,
+        width,
+        height,
+        duration_seconds,
+    })
 }
 
 fn whatsapp_message_type(message: &wa::Message, text: Option<&str>) -> String {
@@ -874,5 +1076,29 @@ mod tests {
         let manager = WhatsappManager::default();
 
         assert!(!manager.is_channel_active("ch"));
+    }
+
+    #[test]
+    fn group_admin_capabilities_do_not_claim_unsupported_commands() {
+        let capabilities = capabilities();
+
+        for feature in [
+            "groups_manage",
+            "group_exit",
+            "group_member_add",
+            "group_member_remove",
+            "group_invite_accept",
+            "group_member_promote",
+            "group_member_demote",
+            "group_join_request_accept",
+            "group_join_request_reject",
+        ] {
+            let capability = capabilities
+                .features
+                .get(feature)
+                .expect("feature should be advertised");
+            assert!(!capability.supported, "{feature} should not claim support");
+            assert!(capability.reason.is_some(), "{feature} should explain why");
+        }
     }
 }

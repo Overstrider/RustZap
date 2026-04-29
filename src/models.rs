@@ -279,6 +279,12 @@ pub struct MediaObject {
     pub permanent_object_key: Option<String>,
     pub public_url: Option<String>,
     pub thumbnail_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<f64>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub expires_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339::option")]
@@ -332,6 +338,27 @@ pub struct DirtyAckRequest {
     pub consumer_id: String,
     pub processed_until_seq: i64,
     pub lease_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebhookDeliveryAttempt {
+    pub id: String,
+    pub project_id: String,
+    pub company_id: String,
+    pub callback_id: String,
+    pub event_id: String,
+    pub attempt: u32,
+    pub status: String,
+    pub http_status: Option<u16>,
+    pub error_message: Option<String>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub first_failed_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub last_failed_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub next_retry_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

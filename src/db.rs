@@ -10,7 +10,7 @@ use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use crate::{
     config::{AppConfig, KafkaConfig},
     eventbus::{partition_key, topic_for_event},
-    models::{CommonEvent, MediaObject, Message, Transcript},
+    models::{CommonEvent, MediaObject, Message, Transcript, WebhookDeliveryAttempt},
     state::{
         ContactRecord, DirtyLeaseRecord, DirtyRecord, GroupMemberRecord, GroupRecord,
         PersistedStore,
@@ -606,6 +606,8 @@ impl MetadataDb {
         self.persist_dirty_leases(store).await?;
         self.persist_consumer_state(store).await?;
         self.persist_idempotency(store).await?;
+        self.persist_callbacks(store).await?;
+        self.persist_webhook_delivery_attempts(store).await?;
         Ok(())
     }
 
@@ -1274,6 +1276,110 @@ impl MetadataDb {
             .await
             .with_context(|| format!("failed to persist idempotency key {key}"))?;
         }
+        Ok(())
+    }
+
+    async fn persist_callbacks(&self, store: &PersistedStore) -> anyhow::Result<()> {
+        for callback in store.callbacks.values() {
+            let id = value_str(callback, "id").unwrap_or_else(|| "callback_unknown".to_string());
+            let project_id =
+                value_str(callback, "project_id").unwrap_or_else(|| "default".to_string());
+            let company_id =
+                value_str(callback, "company_id").unwrap_or_else(|| "default".to_string());
+            self.upsert_project(&project_id, &project_id, "active")
+                .await?;
+            self.upsert_company(&project_id, &company_id, &company_id, "active")
+                .await?;
+            let events: Vec<String> = callback
+                .get("events")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_else(|| vec!["conversation.dirty".to_string()]);
+            query::<Postgres>(
+                r#"
+                INSERT INTO consumer_callbacks (
+                  id, project_id, company_id, url, encrypted_secret, enabled,
+                  events, max_batch_size, timeout_seconds, updated_at
+                )
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,now())
+                ON CONFLICT (id) DO UPDATE SET
+                  url = EXCLUDED.url,
+                  encrypted_secret = EXCLUDED.encrypted_secret,
+                  enabled = EXCLUDED.enabled,
+                  events = EXCLUDED.events,
+                  max_batch_size = EXCLUDED.max_batch_size,
+                  timeout_seconds = EXCLUDED.timeout_seconds,
+                  updated_at = now()
+                "#,
+            )
+            .bind(&id)
+            .bind(&project_id)
+            .bind(&company_id)
+            .bind(
+                value_str(callback, "url")
+                    .unwrap_or_else(|| "http://localhost/webhook".to_string()),
+            )
+            .bind(value_str(callback, "secret"))
+            .bind(callback["enabled"].as_bool().unwrap_or(true))
+            .bind(events)
+            .bind(callback["max_batch_size"].as_i64().unwrap_or(100) as i32)
+            .bind(callback["timeout_seconds"].as_i64().unwrap_or(10) as i32)
+            .execute(&self.pool)
+            .await
+            .with_context(|| format!("failed to persist consumer callback {id}"))?;
+        }
+        Ok(())
+    }
+
+    async fn persist_webhook_delivery_attempts(
+        &self,
+        store: &PersistedStore,
+    ) -> anyhow::Result<()> {
+        for attempt in &store.webhook_delivery_attempts {
+            self.persist_webhook_delivery_attempt(attempt).await?;
+        }
+        Ok(())
+    }
+
+    async fn persist_webhook_delivery_attempt(
+        &self,
+        attempt: &WebhookDeliveryAttempt,
+    ) -> anyhow::Result<()> {
+        query::<Postgres>(
+            r#"
+            INSERT INTO webhook_delivery_attempts (
+              id, callback_id, event_id, attempt, status, http_status,
+              error_message, first_failed_at, last_failed_at, next_retry_at, created_at
+            )
+            VALUES ($1::uuid,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            ON CONFLICT (id) DO NOTHING
+            "#,
+        )
+        .bind(&attempt.id)
+        .bind(&attempt.callback_id)
+        .bind(&attempt.event_id)
+        .bind(i32::try_from(attempt.attempt).unwrap_or(i32::MAX))
+        .bind(&attempt.status)
+        .bind(attempt.http_status.map(i32::from))
+        .bind(&attempt.error_message)
+        .bind(attempt.first_failed_at)
+        .bind(attempt.last_failed_at)
+        .bind(attempt.next_retry_at)
+        .bind(attempt.created_at)
+        .execute(&self.pool)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to persist webhook attempt {}/{}",
+                attempt.callback_id, attempt.event_id
+            )
+        })?;
         Ok(())
     }
 
