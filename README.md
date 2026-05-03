@@ -1,6 +1,6 @@
 # RustZap
 
-RustZap is a Rust 2024 WhatsApp conversation gateway for SaaS consumers. It exposes REST and WebSocket APIs, stores conversation state, tracks dirty conversations for cursor-based processing, manages media metadata, and provides dev simulation endpoints plus a local Next.js tester.
+RustZap is a Rust 2024 WhatsApp conversation gateway for SaaS consumers. It exposes REST APIs, compact event contracts, internal diagnostic WebSocket signals, dirty conversation cursors, media metadata, and dev simulation endpoints.
 
 ## Quick Start
 
@@ -12,6 +12,8 @@ cargo run
 API defaults:
 
 - API: `http://<LAN_IP>:8167`
+- REST contract: `http://<LAN_IP>:8167/openapi.json`
+- Event contract: `http://<LAN_IP>:8167/asyncapi.json`
 - Project token: `dev_project_key`
 - Admin token: `dev_admin_key`
 
@@ -24,20 +26,13 @@ $EDITOR .env.production .env.secrets
 ./scripts/deploy.sh production
 ```
 
-This builds the RustZap image, starts RustZap, Postgres, Redpanda, and the dev tester frontend as Podman containers, applies migrations, waits for readiness, and prints the service status.
+This builds the RustZap image, starts RustZap, Postgres, and Redpanda as Podman containers, applies migrations, waits for readiness, and prints the service status.
 
 - API: `http://<LAN_IP>:8167`
-- Dev tester: `http://<LAN_IP>:3167`
 
-## Dev Tester
+## Consumer Backend
 
-```bash
-cd dev-tester
-npm install
-npm run dev
-```
-
-Open `http://<LAN_IP>:3167`.
+Production browsers should connect to the SaaS/backend above RustZap, not to RustZap directly. RustZap emits compact Kafka/Redpanda signals and remains the REST source of truth for cursor reads and idempotent commands. See `examples/whatsapp-web-shared/` for the consumer backend realtime contract.
 
 ## Important Constraints
 

@@ -273,6 +273,16 @@ impl WhatsappManager {
             .is_some_and(|supervisor| !supervisor.task.is_finished())
     }
 
+    pub fn is_channel_connected(&self, channel_id: &str) -> bool {
+        self.supervisors
+            .lock()
+            .expect("whatsapp manager lock poisoned")
+            .get(channel_id)
+            .is_some_and(|supervisor| {
+                !supervisor.task.is_finished() && supervisor.client.is_connected()
+            })
+    }
+
     pub fn stop_channel(&self, channel_id: &str) {
         if let Some(supervisor) = self
             .supervisors
@@ -294,11 +304,19 @@ impl WhatsappManager {
                 .supervisors
                 .lock()
                 .expect("whatsapp manager lock poisoned");
-            if let Some(supervisor) = supervisors.get(&runtime.channel_id) {
-                if !supervisor.task.is_finished() {
-                    return Ok(());
-                }
-                supervisors.remove(&runtime.channel_id);
+            let existing_is_connected =
+                supervisors
+                    .get(&runtime.channel_id)
+                    .is_some_and(|supervisor| {
+                        !supervisor.task.is_finished() && supervisor.client.is_connected()
+                    });
+            if existing_is_connected {
+                return Ok(());
+            }
+            if let Some(supervisor) = supervisors.remove(&runtime.channel_id)
+                && !supervisor.task.is_finished()
+            {
+                supervisor.task.abort();
             }
         }
 
@@ -1076,6 +1094,7 @@ mod tests {
         let manager = WhatsappManager::default();
 
         assert!(!manager.is_channel_active("ch"));
+        assert!(!manager.is_channel_connected("ch"));
     }
 
     #[test]

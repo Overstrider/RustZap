@@ -86,6 +86,36 @@ impl MetadataDb {
             .fetch_one(&self.pool)
             .await
             .context("metadata Postgres readiness query failed")?;
+        let critical_tables = vec![
+            "projects",
+            "companies",
+            "channel_accounts",
+            "conversations",
+            "messages",
+            "media_objects",
+            "transcripts",
+            "consumer_callbacks",
+            "metadata_snapshots",
+            "event_outbox",
+            "event_inbox",
+        ];
+        let missing: Vec<String> = query_scalar::<Postgres, String>(
+            r#"
+            SELECT table_name
+            FROM unnest($1::text[]) AS table_name
+            WHERE to_regclass('public.' || table_name) IS NULL
+            "#,
+        )
+        .bind(&critical_tables)
+        .fetch_all(&self.pool)
+        .await
+        .context("metadata migration readiness query failed")?;
+        if !missing.is_empty() {
+            bail!(
+                "metadata migrations missing critical tables: {}",
+                missing.join(", ")
+            );
+        }
         Ok(())
     }
 
@@ -1325,7 +1355,7 @@ impl MetadataDb {
                 value_str(callback, "url")
                     .unwrap_or_else(|| "http://localhost/webhook".to_string()),
             )
-            .bind(value_str(callback, "secret"))
+            .bind(value_str(callback, "encrypted_secret"))
             .bind(callback["enabled"].as_bool().unwrap_or(true))
             .bind(events)
             .bind(callback["max_batch_size"].as_i64().unwrap_or(100) as i32)

@@ -7,7 +7,7 @@ COPY src ./src
 COPY migrations ./migrations
 RUN cargo build --release --features external-integrations
 
-FROM docker.io/library/debian:bookworm-slim AS runtime
+FROM docker.io/library/debian:trixie-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates ffmpeg curl \
     && rm -rf /var/lib/apt/lists/* \

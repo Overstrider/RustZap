@@ -1,5 +1,7 @@
 use std::{env, net::SocketAddr, path::PathBuf, str::FromStr};
 
+use crate::secrets::SecretMasterKey;
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub env: String,
@@ -18,6 +20,8 @@ pub struct AppConfig {
     pub event_bus: EventBusMode,
     pub consumer_signal_mode: ConsumerSignalMode,
     pub storage_provider: StorageProvider,
+    pub local_storage_dir: PathBuf,
+    pub r2_ready_write_check: bool,
     pub r2: R2Config,
     pub kafka: KafkaConfig,
     pub webhook: WebhookConfig,
@@ -31,6 +35,8 @@ pub struct AppConfig {
     pub media_quick_delete_threshold_mb: u64,
     pub media_reject_threshold_mb: u64,
     pub webhook_signing_header: String,
+    pub secret_master_key: Option<SecretMasterKey>,
+    pub secret_master_key_error: Option<String>,
     pub log_redact_message_text: bool,
     pub log_redact_phone: bool,
 }
@@ -155,6 +161,8 @@ impl AppConfig {
             event_bus: EventBusMode::from_env(),
             consumer_signal_mode: ConsumerSignalMode::from_env(),
             storage_provider: StorageProvider::from_env(),
+            local_storage_dir: PathBuf::from(env_or("LOCAL_STORAGE_DIR", "/tmp/rustzap/media")),
+            r2_ready_write_check: env_bool("R2_READY_WRITE_CHECK", false),
             r2: R2Config::from_env(),
             kafka: KafkaConfig::from_env(),
             webhook: WebhookConfig::from_env(),
@@ -171,6 +179,10 @@ impl AppConfig {
             media_quick_delete_threshold_mb: env_u64("MEDIA_QUICK_DELETE_THRESHOLD_MB", 25),
             media_reject_threshold_mb: env_u64("MEDIA_REJECT_THRESHOLD_MB", 100),
             webhook_signing_header: env_or("WEBHOOK_SIGNING_HEADER", "X-RustZap-Signature"),
+            secret_master_key: secret_master_key_from_env().ok().flatten(),
+            secret_master_key_error: secret_master_key_from_env()
+                .err()
+                .map(|err| err.to_string()),
             log_redact_message_text: env_bool("RUSTZAP_LOG_REDACT_MESSAGE_TEXT", true),
             log_redact_phone: env_bool("RUSTZAP_LOG_REDACT_PHONE", true),
         }
@@ -181,6 +193,9 @@ impl AppConfig {
     }
 
     pub fn public_object_url(&self, object_key: &str) -> Option<String> {
+        if self.storage_provider != StorageProvider::R2 {
+            return None;
+        }
         self.r2.public_object_url(object_key)
     }
 
@@ -403,6 +418,14 @@ fn env_first(keys: &[&str]) -> Option<String> {
         .find_map(|key| env::var(key).ok().filter(|value| !value.trim().is_empty()))
 }
 
+fn secret_master_key_from_env() -> Result<Option<SecretMasterKey>, crate::secrets::SecretError> {
+    let Some(value) = env_first(&["RUSTZAP_SECRET_MASTER_KEY", "RUSTZAP_SECRETS_MASTER_KEY"])
+    else {
+        return Ok(None);
+    };
+    SecretMasterKey::from_env_value(&value).map(Some)
+}
+
 fn env_bool(key: &str, default: bool) -> bool {
     env::var(key)
         .ok()
@@ -565,5 +588,20 @@ mod tests {
         assert_eq!(config.consumer_max_poll_records, 500);
         assert_eq!(config.retry_max_attempts, 8);
         assert_eq!(config.request_timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn public_object_url_is_only_used_for_r2_storage() {
+        let mut config = AppConfig::from_env();
+        config.r2.public_url = Some("https://pub.example".to_string());
+
+        config.storage_provider = StorageProvider::LocalFs;
+        assert_eq!(config.public_object_url("media/image.jpg"), None);
+
+        config.storage_provider = StorageProvider::R2;
+        assert_eq!(
+            config.public_object_url("media/image.jpg").as_deref(),
+            Some("https://pub.example/media/image.jpg")
+        );
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use axum::{
     Json, Router,
@@ -23,18 +23,18 @@ use crate::{
     media::{R2ObjectKeyInput, r2_object_key},
     models::{
         ChannelAccountRequest, CompanyRequest, DirtyAckRequest, DirtyListResponse, PageQuery,
-        ProjectCompanyChannelPath, ProjectCompanyContactPath, ProjectCompanyConversationPath,
-        ProjectCompanyGroupMemberPath, ProjectCompanyGroupPath, ProjectCompanyMediaPath,
-        ProjectCompanyMessagePath, ProjectCompanyPath, ProjectPath, ProjectRequest, ReadyCheck,
+        ProjectCompanyCallbackPath, ProjectCompanyChannelPath, ProjectCompanyContactPath,
+        ProjectCompanyContactPhonePath, ProjectCompanyConversationPath,
+        ProjectCompanyGroupJoinRequestPath, ProjectCompanyGroupMemberPath, ProjectCompanyGroupPath,
+        ProjectCompanyMediaPath, ProjectCompanyMessagePath, ProjectCompanyPath, ReadyCheck,
         ReadyResponse, ReceiptRequest, SendMessageRequest, SimulateInboundMediaRequest,
         SimulateInboundTextRequest, SubscribeRequest,
     },
     security::{
-        Principal, authorize, authorize_company, authorize_project, authorize_token,
-        generate_api_key, idempotency_key, register_project_api_key,
+        Principal, actor_id, authorize, authorize_company, authorize_project, idempotency_key,
     },
     state::{AppState, OutboundMediaUpload, RateLimitScope},
-    storage::{copy_r2_object, delete_r2_object, presigned_r2_get_url},
+    storage::presigned_r2_get_url,
     whatsapp,
 };
 
@@ -44,6 +44,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/ready", get(ready))
         .route("/metrics", get(metrics))
         .route("/openapi.json", get(openapi_json))
+        .route("/asyncapi.json", get(asyncapi_json))
         .route("/docs", get(docs))
         .route("/debug/kafka", get(debug_kafka))
         .route("/debug/kafka/deadletters", get(debug_kafka_deadletters))
@@ -55,235 +56,224 @@ pub fn build_router(state: AppState) -> Router {
         .route("/debug/channels", get(debug_channels))
         .route("/dev-media/{media_id}", get(dev_media_preview))
         .route("/ws/v1", get(websocket_handler))
-        .route("/v1/projects", post(create_project))
-        .route("/v1/projects/{project_id}/api-keys", post(create_api_key))
-        .route("/v1/projects/{project_id}/companies", post(create_company))
+        .route("/v1/companies", post(create_company))
+        .route("/v1/companies/{company_id}", get(get_company))
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}",
-            get(get_company),
-        )
-        .route(
-            "/v1/projects/{project_id}/companies/{company_id}/channels/whatsapp/accounts",
+            "/v1/companies/{company_id}/channels/whatsapp/accounts",
             post(create_channel_account),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/connect",
+            "/v1/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/connect",
             post(connect_channel),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/disconnect",
+            "/v1/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/disconnect",
             post(disconnect_channel),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/channels/whatsapp/accounts/{channel_id}",
+            "/v1/companies/{company_id}/channels/whatsapp/accounts/{channel_id}",
             get(get_channel),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/qr",
+            "/v1/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/qr",
             get(get_qr),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/pair-code",
+            "/v1/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/pair-code",
             post(pair_code),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/capabilities",
+            "/v1/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/capabilities",
             get(capabilities),
         )
+        .route("/v1/companies/{company_id}/contacts", get(list_contacts))
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/contacts",
-            get(list_contacts),
-        )
-        .route(
-            "/v1/projects/{project_id}/companies/{company_id}/contacts/by-phone/{phone_e164}",
+            "/v1/companies/{company_id}/contacts/by-phone/{phone_e164}",
             get(get_contact_by_phone),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/contacts/{contact_id}",
+            "/v1/companies/{company_id}/contacts/{contact_id}",
             get(get_contact),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/contacts/{contact_id}/media",
+            "/v1/companies/{company_id}/contacts/{contact_id}/media",
             get(contact_media),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/contacts/{contact_id}/conversations",
+            "/v1/companies/{company_id}/contacts/{contact_id}/conversations",
             get(contact_conversations),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/conversations",
+            "/v1/companies/{company_id}/conversations",
             get(list_conversations),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/conversations/{conversation_id}",
+            "/v1/companies/{company_id}/conversations/{conversation_id}",
             get(get_conversation).patch(patch_conversation),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/conversations/{conversation_id}/messages",
+            "/v1/companies/{company_id}/conversations/{conversation_id}/messages",
             get(list_messages).post(send_message),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/conversations/{conversation_id}/search",
+            "/v1/companies/{company_id}/conversations/{conversation_id}/search",
             get(search_messages),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/conversations/{conversation_id}/media",
+            "/v1/companies/{company_id}/conversations/{conversation_id}/media",
             get(conversation_media),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/conversations/{conversation_id}/starred",
+            "/v1/companies/{company_id}/conversations/{conversation_id}/starred",
             get(conversation_starred),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/conversations/{conversation_id}/mark-read",
+            "/v1/companies/{company_id}/conversations/{conversation_id}/mark-read",
             post(mark_read),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/conversations/{conversation_id}/typing",
+            "/v1/companies/{company_id}/conversations/{conversation_id}/typing",
             post(typing),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/messages/{message_id}",
+            "/v1/companies/{company_id}/messages/{message_id}",
             get(get_message),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/messages/{message_id}/react",
+            "/v1/companies/{company_id}/messages/{message_id}/react",
             post(react_message).delete(delete_react_message),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/messages/{message_id}/pin",
+            "/v1/companies/{company_id}/messages/{message_id}/pin",
             post(pin_message).delete(unpin_message),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/messages/{message_id}/star",
+            "/v1/companies/{company_id}/messages/{message_id}/star",
             post(star_message).delete(unstar_message),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/media/upload-outbound",
+            "/v1/companies/{company_id}/media/upload-outbound",
             post(upload_outbound),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/media/{media_id}",
+            "/v1/companies/{company_id}/media/{media_id}",
             get(get_media).delete(delete_media),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/media/{media_id}/download-url",
+            "/v1/companies/{company_id}/media/{media_id}/download-url",
             get(download_url),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/media/{media_id}/save",
+            "/v1/companies/{company_id}/media/{media_id}/save",
             post(save_media),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/messages/{message_id}/transcript",
+            "/v1/companies/{company_id}/messages/{message_id}/transcript",
             get(get_transcript),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/messages/{message_id}/transcribe",
+            "/v1/companies/{company_id}/messages/{message_id}/transcribe",
             post(transcribe_message),
         )
+        .route("/v1/companies/{company_id}/groups", get(list_groups))
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/groups",
-            get(list_groups),
-        )
-        .route(
-            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}",
+            "/v1/companies/{company_id}/groups/{group_id}",
             get(get_group),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/members",
+            "/v1/companies/{company_id}/groups/{group_id}/members",
             get(group_members).post(add_group_member),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/media",
+            "/v1/companies/{company_id}/groups/{group_id}/media",
             get(group_media),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/starred",
+            "/v1/companies/{company_id}/groups/{group_id}/starred",
             get(group_starred),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/search",
+            "/v1/companies/{company_id}/groups/{group_id}/search",
             get(group_search),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/exit",
+            "/v1/companies/{company_id}/groups/{group_id}/exit",
             post(group_exit),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/members/{contact_id}",
+            "/v1/companies/{company_id}/groups/{group_id}/members/{contact_id}",
             delete(remove_group_member),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/members/{contact_id}/promote",
+            "/v1/companies/{company_id}/groups/{group_id}/members/{contact_id}/promote",
             post(promote_group_member),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/members/{contact_id}/demote",
+            "/v1/companies/{company_id}/groups/{group_id}/members/{contact_id}/demote",
             post(demote_group_member),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/join-requests/{request_id}/accept",
+            "/v1/companies/{company_id}/groups/{group_id}/join-requests/{request_id}/accept",
             post(accept_join_request),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/join-requests/{request_id}/reject",
+            "/v1/companies/{company_id}/groups/{group_id}/join-requests/{request_id}/reject",
             post(reject_join_request),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/dirty-conversations",
+            "/v1/companies/{company_id}/dirty-conversations",
             get(list_dirty),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/dirty-conversations/{conversation_id}/ack",
+            "/v1/companies/{company_id}/dirty-conversations/{conversation_id}/ack",
             post(ack_dirty),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/consumer-callbacks",
+            "/v1/companies/{company_id}/consumer-callbacks",
             get(list_callbacks).post(create_callback),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/consumer-callbacks/{callback_id}",
+            "/v1/companies/{company_id}/consumer-callbacks/{callback_id}",
             patch(update_callback).delete(delete_callback),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/privacy/contacts/{contact_id}/export",
+            "/v1/companies/{company_id}/privacy/contacts/{contact_id}/export",
             post(privacy_export),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/privacy/contacts/{contact_id}",
+            "/v1/companies/{company_id}/privacy/contacts/{contact_id}",
             delete(privacy_delete),
         )
         .route(
-            "/v1/projects/{project_id}/companies/{company_id}/privacy/contacts/{contact_id}/anonymize",
+            "/v1/companies/{company_id}/privacy/contacts/{contact_id}/anonymize",
             post(privacy_anonymize),
         )
         .route(
-            "/v1/dev/projects/{project_id}/companies/{company_id}/simulate/inbound-text",
+            "/v1/dev/companies/{company_id}/simulate/inbound-text",
             post(dev_inbound_text),
         )
         .route(
-            "/v1/dev/projects/{project_id}/companies/{company_id}/simulate/inbound-audio",
+            "/v1/dev/companies/{company_id}/simulate/inbound-audio",
             post(dev_inbound_audio),
         )
         .route(
-            "/v1/dev/projects/{project_id}/companies/{company_id}/simulate/inbound-image",
+            "/v1/dev/companies/{company_id}/simulate/inbound-image",
             post(dev_inbound_image),
         )
         .route(
-            "/v1/dev/projects/{project_id}/companies/{company_id}/simulate/receipt",
+            "/v1/dev/companies/{company_id}/simulate/receipt",
             post(dev_receipt),
         )
         .route(
-            "/v1/dev/projects/{project_id}/companies/{company_id}/simulate/qr-rotate",
+            "/v1/dev/companies/{company_id}/simulate/qr-rotate",
             post(dev_qr_rotate),
         )
         .route(
-            "/v1/dev/projects/{project_id}/companies/{company_id}/simulate/group-event",
+            "/v1/dev/companies/{company_id}/simulate/group-event",
             post(dev_group_event),
         )
         .route(
-            "/v1/dev/projects/{project_id}/companies/{company_id}/simulate/reset",
+            "/v1/dev/companies/{company_id}/simulate/reset",
             post(dev_reset),
         )
         .with_state(state)
@@ -317,14 +307,21 @@ async fn ready(State(state): State<AppState>) -> Json<ReadyResponse> {
     let session_dir_ok = std::fs::create_dir_all(&state.config.wa_session_sqlite_dir).is_ok();
     let metadata_check = state.metadata_ready().await;
     let event_bus_check = state.event_bus_ready().await;
+    let storage_check = state.storage_ready().await;
+    let webhook_secret_check = state.webhook_secret_ready();
     let metadata_ok = match state.config.metadata_db {
         MetadataDbMode::InMemory => true,
         MetadataDbMode::Postgres => {
             state.config.database_url.as_deref().is_some() && metadata_check.is_ok()
         }
     };
+    let ok = metadata_ok
+        && session_dir_ok
+        && event_bus_check.ok
+        && storage_check.ok
+        && webhook_secret_check.ok;
     Json(ReadyResponse {
-        ok: metadata_ok && session_dir_ok && event_bus_check.ok,
+        ok,
         checks: vec![
             ReadyCheck {
                 name: "metadata_db".to_string(),
@@ -354,6 +351,8 @@ async fn ready(State(state): State<AppState>) -> Json<ReadyResponse> {
                 ok: session_dir_ok,
                 detail: state.config.wa_session_sqlite_dir.display().to_string(),
             },
+            storage_check,
+            webhook_secret_check,
         ],
     })
 }
@@ -378,7 +377,7 @@ async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn docs() -> Html<&'static str> {
     Html(
-        "<!doctype html><title>RustZap API</title><h1>RustZap API</h1><a href=\"/openapi.json\">OpenAPI JSON</a>",
+        "<!doctype html><title>RustZap API</title><h1>RustZap API</h1><a href=\"/openapi.json\">OpenAPI JSON</a><br><a href=\"/asyncapi.json\">AsyncAPI JSON</a>",
     )
 }
 
@@ -387,9 +386,6 @@ async fn openapi_json() -> Json<Value> {
         "openapi": "3.1.0",
         "info": {"title": "RustZap", "version": "0.1.0"},
         "components": {
-            "securitySchemes": {
-                "bearerAuth": {"type": "http", "scheme": "bearer"}
-            },
             "schemas": {
                 "ErrorEnvelope": {
                     "type": "object",
@@ -422,114 +418,102 @@ async fn openapi_json() -> Json<Value> {
             "/health": {"get": {"summary": "Liveness"}},
             "/ready": {"get": {"summary": "Readiness"}},
             "/ws/v1": {"get": {"summary": "WebSocket events"}},
-            "/v1/projects/{project_id}/companies/{company_id}/contacts": {
+            "/v1/companies/{company_id}/contacts": {
                 "get": {
                     "summary": "List contacts",
                     "parameters": [{"name": "limit", "in": "query"}, {"name": "cursor", "in": "query"}],
-                    "security": [{"bearerAuth": ["contacts:read"]}]
                 }
             },
-            "/v1/projects/{project_id}/companies/{company_id}/contacts/{contact_id}": {
-                "get": {"summary": "Inspect contact", "security": [{"bearerAuth": ["contacts:read"]}]}
+            "/v1/companies/{company_id}/contacts/{contact_id}": {
+                "get": {"summary": "Inspect contact"}
             },
-            "/v1/projects/{project_id}/companies/{company_id}/contacts/{contact_id}/media": {
+            "/v1/companies/{company_id}/contacts/{contact_id}/media": {
                 "get": {
                     "summary": "List contact media",
                     "parameters": [{"name": "limit", "in": "query"}, {"name": "cursor", "in": "query"}],
-                    "security": [{"bearerAuth": ["media:read"]}]
                 }
             },
-            "/v1/projects/{project_id}/companies/{company_id}/contacts/{contact_id}/conversations": {
+            "/v1/companies/{company_id}/contacts/{contact_id}/conversations": {
                 "get": {
                     "summary": "List contact conversations",
                     "parameters": [{"name": "limit", "in": "query"}, {"name": "cursor", "in": "query"}],
-                    "security": [{"bearerAuth": ["contacts:read"]}]
                 }
             },
-            "/v1/projects/{project_id}/companies/{company_id}/conversations": {
+            "/v1/companies/{company_id}/conversations": {
                 "get": {
                     "summary": "List conversations",
                     "parameters": [{"name": "limit", "in": "query"}, {"name": "cursor", "in": "query"}],
-                    "security": [{"bearerAuth": ["conversations:read"]}]
                 }
             },
-            "/v1/projects/{project_id}/companies/{company_id}/conversations/{conversation_id}/messages": {
+            "/v1/companies/{company_id}/conversations/{conversation_id}/messages": {
                 "get": {"summary": "Read messages by cursor"},
                 "post": {"summary": "Send idempotent message"}
             },
-            "/v1/projects/{project_id}/companies/{company_id}/conversations/{conversation_id}/search": {
+            "/v1/companies/{company_id}/conversations/{conversation_id}/search": {
                 "get": {
                     "summary": "Search conversation messages",
                     "parameters": [{"name": "q", "in": "query"}, {"name": "limit", "in": "query"}, {"name": "cursor", "in": "query"}],
-                    "security": [{"bearerAuth": ["messages:read"]}]
                 }
             },
-            "/v1/projects/{project_id}/companies/{company_id}/conversations/{conversation_id}/media": {
+            "/v1/companies/{company_id}/conversations/{conversation_id}/media": {
                 "get": {
                     "summary": "List conversation media",
                     "parameters": [{"name": "limit", "in": "query"}, {"name": "cursor", "in": "query"}],
-                    "security": [{"bearerAuth": ["media:read"]}]
                 }
             },
-            "/v1/projects/{project_id}/companies/{company_id}/conversations/{conversation_id}/starred": {
+            "/v1/companies/{company_id}/conversations/{conversation_id}/starred": {
                 "get": {
                     "summary": "List starred conversation messages",
                     "parameters": [{"name": "limit", "in": "query"}, {"name": "cursor", "in": "query"}],
-                    "security": [{"bearerAuth": ["messages:read"]}]
                 }
             },
-            "/v1/projects/{project_id}/companies/{company_id}/groups": {
+            "/v1/companies/{company_id}/groups": {
                 "get": {
                     "summary": "List groups",
                     "parameters": [{"name": "limit", "in": "query"}, {"name": "cursor", "in": "query"}],
-                    "security": [{"bearerAuth": ["groups:read"]}]
                 }
             },
-            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}": {
-                "get": {"summary": "Inspect group", "security": [{"bearerAuth": ["groups:read"]}]}
+            "/v1/companies/{company_id}/groups/{group_id}": {
+                "get": {"summary": "Inspect group"}
             },
-            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/members": {
+            "/v1/companies/{company_id}/groups/{group_id}/members": {
                 "get": {
                     "summary": "List group members",
                     "parameters": [{"name": "limit", "in": "query"}, {"name": "cursor", "in": "query"}],
-                    "security": [{"bearerAuth": ["groups:read"]}]
                 }
             },
-            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/media": {
+            "/v1/companies/{company_id}/groups/{group_id}/media": {
                 "get": {
                     "summary": "List group media",
                     "parameters": [{"name": "limit", "in": "query"}, {"name": "cursor", "in": "query"}],
-                    "security": [{"bearerAuth": ["media:read"]}]
                 }
             },
-            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/starred": {
+            "/v1/companies/{company_id}/groups/{group_id}/starred": {
                 "get": {
                     "summary": "List starred group messages",
                     "parameters": [{"name": "limit", "in": "query"}, {"name": "cursor", "in": "query"}],
-                    "security": [{"bearerAuth": ["messages:read"]}]
                 }
             },
-            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/search": {
+            "/v1/companies/{company_id}/groups/{group_id}/search": {
                 "get": {
                     "summary": "Search group messages",
                     "parameters": [{"name": "q", "in": "query"}, {"name": "limit", "in": "query"}, {"name": "cursor", "in": "query"}],
-                    "security": [{"bearerAuth": ["messages:read"]}]
                 }
             },
-            "/v1/projects/{project_id}/companies/{company_id}/dirty-conversations": {
+            "/v1/companies/{company_id}/dirty-conversations": {
                 "get": {"summary": "List compact dirty signals"}
             },
-            "/v1/projects/{project_id}/companies/{company_id}/consumer-callbacks": {
+            "/v1/companies/{company_id}/consumer-callbacks": {
                 "get": {"summary": "List persisted callbacks"},
                 "post": {"summary": "Create persisted callback"}
             },
-            "/v1/projects/{project_id}/companies/{company_id}/privacy/contacts/{contact_id}/export": {
+            "/v1/companies/{company_id}/privacy/contacts/{contact_id}/export": {
                 "post": {"summary": "Export contact privacy data"}
             },
-            "/v1/projects/{project_id}/companies/{company_id}/privacy/contacts/{contact_id}": {
+            "/v1/companies/{company_id}/privacy/contacts/{contact_id}": {
                 "delete": {"summary": "Delete and redact contact privacy data"}
             },
-            "/v1/projects/{project_id}/companies/{company_id}/privacy/contacts/{contact_id}/anonymize": {
+            "/v1/companies/{company_id}/privacy/contacts/{contact_id}/anonymize": {
                 "post": {"summary": "Anonymize contact privacy data"}
             }
         }
@@ -537,7 +521,419 @@ async fn openapi_json() -> Json<Value> {
     if let Some(paths) = spec.get_mut("paths").and_then(Value::as_object_mut) {
         add_openapi_paths(paths);
     }
+    decorate_openapi_contract(&mut spec);
     Json(spec)
+}
+
+fn decorate_openapi_contract(spec: &mut Value) {
+    add_openapi_schemas(spec);
+    let Some(paths) = spec.get_mut("paths").and_then(Value::as_object_mut) else {
+        return;
+    };
+
+    for methods in paths.values_mut().filter_map(Value::as_object_mut) {
+        for operation in methods.values_mut().filter_map(Value::as_object_mut) {
+            operation
+                .entry("responses".to_string())
+                .or_insert_with(|| json!({"200": ok_response("OK", None)}));
+            if let Some(responses) = operation
+                .get_mut("responses")
+                .and_then(Value::as_object_mut)
+            {
+                responses
+                    .entry("default".to_string())
+                    .or_insert_with(|| error_response("Standard error envelope"));
+            }
+        }
+    }
+
+    if let Some(messages) = paths
+        .get_mut("/v1/companies/{company_id}/conversations/{conversation_id}/messages")
+        .and_then(Value::as_object_mut)
+    {
+        messages.insert(
+            "get".to_string(),
+            json!({
+                "summary": "Read messages by conversation cursor",
+                "parameters": [
+                    path_parameter("company_id"),
+                    path_parameter("conversation_id"),
+                    query_parameter("after_seq", "integer", false, "Return messages after this conversation_seq"),
+                    query_parameter("before_seq", "integer", false, "Return messages before this conversation_seq"),
+                    query_parameter("limit", "integer", false, "Maximum number of messages to return")
+                ],
+                "responses": {
+                    "200": ok_response("Messages page", Some("#/components/schemas/MessagesPage")),
+                    "default": error_response("Standard error envelope")
+                }
+            }),
+        );
+        messages.insert(
+            "post".to_string(),
+            json!({
+                "summary": "Send an idempotent message command",
+                "parameters": [
+                    path_parameter("company_id"),
+                    path_parameter("conversation_id"),
+                    idempotency_header_parameter()
+                ],
+                "requestBody": json_request_body("#/components/schemas/SendMessageRequest"),
+                "responses": {
+                    "202": ok_response("Command accepted", None),
+                    "409": error_response("Idempotency conflict"),
+                    "default": error_response("Standard error envelope")
+                }
+            }),
+        );
+    }
+
+    if let Some(dirty) = paths
+        .get_mut("/v1/companies/{company_id}/dirty-conversations")
+        .and_then(Value::as_object_mut)
+    {
+        dirty.insert(
+            "get".to_string(),
+            json!({
+                "summary": "List compact dirty conversation signals for one consumer",
+                "parameters": [
+                    path_parameter("company_id"),
+                    query_parameter("consumer_id", "string", true, "Stable backend consumer identifier"),
+                    query_parameter("limit", "integer", false, "Maximum number of dirty conversations to lease")
+                ],
+                "responses": {
+                    "200": ok_response("Dirty conversation leases", Some("#/components/schemas/DirtyListResponse")),
+                    "default": error_response("Standard error envelope")
+                }
+            }),
+        );
+    }
+
+    if let Some(ack) = paths
+        .get_mut("/v1/companies/{company_id}/dirty-conversations/{conversation_id}/ack")
+        .and_then(Value::as_object_mut)
+    {
+        ack.insert(
+            "post".to_string(),
+            json!({
+                "summary": "Acknowledge a leased dirty conversation cursor",
+                "parameters": [
+                    path_parameter("company_id"),
+                    path_parameter("conversation_id")
+                ],
+                "requestBody": json_request_body("#/components/schemas/DirtyAckRequest"),
+                "responses": {
+                    "200": ok_response("Dirty ACK result", None),
+                    "409": error_response("Lease conflict"),
+                    "default": error_response("Standard error envelope")
+                }
+            }),
+        );
+    }
+
+    paths.entry("/asyncapi.json".to_string()).or_insert_with(|| {
+        json!({"get": {"summary": "AsyncAPI event contract", "responses": {"200": ok_response("AsyncAPI document", None), "default": error_response("Standard error envelope")}}})
+    });
+}
+
+fn add_openapi_schemas(spec: &mut Value) {
+    let Some(schemas) = spec
+        .get_mut("components")
+        .and_then(|components| components.get_mut("schemas"))
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    for (name, schema) in [
+        (
+            "CommonEvent",
+            json!({
+                "type": "object",
+                "required": ["event_id", "event_type", "project_id", "company_id", "trace_id", "correlation_id", "occurred_at", "payload"],
+                "properties": common_event_properties()
+            }),
+        ),
+        (
+            "DirtyAckRequest",
+            json!({
+                "type": "object",
+                "required": ["consumer_id", "processed_until_seq", "lease_token"],
+                "properties": {
+                    "consumer_id": {"type": "string"},
+                    "processed_until_seq": {"type": "integer", "format": "int64"},
+                    "lease_token": {"type": "string"}
+                }
+            }),
+        ),
+        (
+            "DirtyConversationItem",
+            json!({
+                "type": "object",
+                "required": ["conversation_id", "max_seq", "reason", "priority", "available_at", "lease_token", "locked_until"],
+                "properties": {
+                    "conversation_id": {"type": "string"},
+                    "max_seq": {"type": "integer", "format": "int64"},
+                    "reason": {"type": "string"},
+                    "priority": {"type": "integer"},
+                    "available_at": {"type": "string", "format": "date-time"},
+                    "lease_token": {"type": "string"},
+                    "locked_until": {"type": "string", "format": "date-time"}
+                }
+            }),
+        ),
+        (
+            "DirtyListResponse",
+            json!({
+                "type": "object",
+                "required": ["items"],
+                "properties": {
+                    "items": {"type": "array", "items": {"$ref": "#/components/schemas/DirtyConversationItem"}}
+                }
+            }),
+        ),
+        (
+            "Message",
+            json!({
+                "type": "object",
+                "required": ["id", "conversation_id", "conversation_seq", "direction", "message_type", "status", "delivery_state"],
+                "properties": {
+                    "id": {"type": "string"},
+                    "conversation_id": {"type": "string"},
+                    "conversation_seq": {"type": "integer", "format": "int64"},
+                    "direction": {"type": "string"},
+                    "message_type": {"type": "string"},
+                    "text": {"type": ["string", "null"]},
+                    "media_id": {"type": ["string", "null"]},
+                    "status": {"type": "string"},
+                    "delivery_state": {"type": "string", "enum": ["not_applicable", "pending", "sent", "delivered", "read", "failed"]}
+                }
+            }),
+        ),
+        (
+            "MessagesPage",
+            json!({
+                "type": "object",
+                "required": ["conversation_id", "has_more", "messages"],
+                "properties": {
+                    "conversation_id": {"type": "string"},
+                    "from_seq": {"type": ["integer", "null"], "format": "int64"},
+                    "to_seq": {"type": ["integer", "null"], "format": "int64"},
+                    "has_more": {"type": "boolean"},
+                    "messages": {"type": "array", "items": {"$ref": "#/components/schemas/Message"}}
+                }
+            }),
+        ),
+        (
+            "SendMessageRequest",
+            json!({
+                "type": "object",
+                "required": ["type"],
+                "properties": {
+                    "type": {"type": "string", "examples": ["text"]},
+                    "text": {"type": ["string", "null"]},
+                    "media_id": {"type": ["string", "null"]},
+                    "caption": {"type": ["string", "null"]},
+                    "filename": {"type": ["string", "null"]},
+                    "quoted_message_id": {"type": ["string", "null"]},
+                    "metadata": {"type": ["object", "null"]}
+                }
+            }),
+        ),
+    ] {
+        schemas.insert(name.to_string(), schema);
+    }
+}
+
+fn common_event_properties() -> Value {
+    json!({
+        "event_id": {"type": "string"},
+        "event_type": {"type": "string"},
+        "project_id": {"type": "string"},
+        "company_id": {"type": "string"},
+        "channel_id": {"type": ["string", "null"]},
+        "conversation_id": {"type": ["string", "null"]},
+        "message_id": {"type": ["string", "null"]},
+        "conversation_seq": {"type": ["integer", "null"], "format": "int64"},
+        "trace_id": {"type": "string"},
+        "causation_id": {"type": ["string", "null"]},
+        "correlation_id": {"type": "string"},
+        "occurred_at": {"type": "string", "format": "date-time"},
+        "produced_at": {"type": "string", "format": "date-time"},
+        "payload": {"type": "object", "description": "Compact event-specific metadata. Raw media bytes, full transcripts, and full message history are not allowed."}
+    })
+}
+
+fn path_parameter(name: &str) -> Value {
+    json!({
+        "name": name,
+        "in": "path",
+        "required": true,
+        "schema": {"type": "string"}
+    })
+}
+
+fn query_parameter(name: &str, kind: &str, required: bool, description: &str) -> Value {
+    json!({
+        "name": name,
+        "in": "query",
+        "required": required,
+        "description": description,
+        "schema": {"type": kind}
+    })
+}
+
+fn idempotency_header_parameter() -> Value {
+    json!({
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": true,
+        "description": "Stable command key. Replays with the same JSON body return the same command result; a different body returns 409.",
+        "schema": {"type": "string"}
+    })
+}
+
+fn json_request_body(schema_ref: &str) -> Value {
+    json!({
+        "required": true,
+        "content": {
+            "application/json": {
+                "schema": {"$ref": schema_ref}
+            }
+        }
+    })
+}
+
+fn ok_response(description: &str, schema_ref: Option<&str>) -> Value {
+    match schema_ref {
+        Some(schema_ref) => json!({
+            "description": description,
+            "content": {
+                "application/json": {
+                    "schema": {"$ref": schema_ref}
+                }
+            }
+        }),
+        None => json!({"description": description}),
+    }
+}
+
+fn error_response(description: &str) -> Value {
+    json!({
+        "description": description,
+        "content": {
+            "application/json": {
+                "schema": {"$ref": "#/components/schemas/ErrorEnvelope"}
+            }
+        }
+    })
+}
+
+async fn asyncapi_json() -> Json<Value> {
+    Json(json!({
+        "asyncapi": "3.0.0",
+        "info": {
+            "title": "RustZap M2M Events",
+            "version": "0.1.0",
+            "description": "Compact Kafka/Redpanda and internal WebSocket notification contract. REST cursor reads remain the source of truth."
+        },
+        "servers": {
+            "redpanda": {
+                "host": "{brokers}",
+                "protocol": "kafka",
+                "description": "RustZap to backend-consumer durable signal bus"
+            },
+            "internalWebSocket": {
+                "host": "{rustzap_host}",
+                "pathname": "/ws/v1",
+                "protocol": "wss",
+                "description": "Development/internal diagnostics only; production browsers should use the consumer backend WebSocket."
+            }
+        },
+        "channels": {
+            "conversationDirty": {
+                "address": "{topic_prefix}.conversation.dirty",
+                "messages": {"conversation.dirty": {"$ref": "#/components/messages/conversation.dirty"}}
+            },
+            "messageReceipt": {
+                "address": "{topic_prefix}.delivery.receipt",
+                "messages": {"message.receipt": {"$ref": "#/components/messages/message.receipt"}}
+            },
+            "channelStatus": {
+                "address": "{topic_prefix}.channel.status",
+                "messages": {
+                    "channel.status": {"$ref": "#/components/messages/channel.status"},
+                    "channel.qr": {"$ref": "#/components/messages/channel.qr"}
+                }
+            },
+            "groupEvent": {
+                "address": "{topic_prefix}.group.event",
+                "messages": {"group.updated": {"$ref": "#/components/messages/group.updated"}}
+            },
+            "mediaStored": {
+                "address": "{topic_prefix}.media.stored",
+                "messages": {"media.stored": {"$ref": "#/components/messages/media.stored"}}
+            },
+            "transcriptCompleted": {
+                "address": "{topic_prefix}.audio.transcribed",
+                "messages": {"transcript.completed": {"$ref": "#/components/messages/transcript.completed"}}
+            }
+        },
+        "operations": {
+            "consumeConversationDirty": {"action": "receive", "channel": {"$ref": "#/channels/conversationDirty"}},
+            "consumeMessageReceipt": {"action": "receive", "channel": {"$ref": "#/channels/messageReceipt"}},
+            "consumeChannelStatus": {"action": "receive", "channel": {"$ref": "#/channels/channelStatus"}},
+            "consumeGroupEvent": {"action": "receive", "channel": {"$ref": "#/channels/groupEvent"}},
+            "consumeMediaStored": {"action": "receive", "channel": {"$ref": "#/channels/mediaStored"}},
+            "consumeTranscriptCompleted": {"action": "receive", "channel": {"$ref": "#/channels/transcriptCompleted"}}
+        },
+        "components": {
+            "x-partition-keys": {
+                "conversation": "{project_id}:{company_id}:{conversation_id}",
+                "channel": "{project_id}:{company_id}:{channel_id}"
+            },
+            "schemas": {
+                "CommonEvent": {
+                    "type": "object",
+                    "required": ["event_id", "event_type", "project_id", "company_id", "trace_id", "correlation_id", "occurred_at", "payload"],
+                    "properties": common_event_properties()
+                }
+            },
+            "messages": {
+                "conversation.dirty": asyncapi_message("conversation.dirty", json!({"to_seq": 42, "reason": "new_message", "priority": 100})),
+                "message.receipt": asyncapi_message("message.receipt", json!({"message_id": "msg_123", "receipt_type": "delivered", "delivery_state": "delivered"})),
+                "channel.status": asyncapi_message("channel.status", json!({"status": "connected", "connected_at": "2026-05-02T00:00:00Z"})),
+                "channel.qr": asyncapi_message("channel.qr", json!({"status": "waiting_qr"})),
+                "group.updated": asyncapi_message("group.updated", json!({"group_id": "120363000000000000@g.us"})),
+                "media.stored": asyncapi_message("media.stored", json!({"message_id": "msg_123", "media_id": "media_123", "storage_status": "temporary"})),
+                "transcript.completed": asyncapi_message("transcript.completed", json!({"message_id": "msg_123", "media_id": "media_123", "transcript_id": "tr_123"}))
+            }
+        }
+    }))
+}
+
+fn asyncapi_message(name: &str, payload_example: Value) -> Value {
+    json!({
+        "name": name,
+        "payload": {"$ref": "#/components/schemas/CommonEvent"},
+        "examples": [{
+            "name": format!("{name} example"),
+            "payload": {
+                "event_id": "evt_00000000000000000000000000",
+                "event_type": name,
+                "project_id": "rustzap_internal",
+                "company_id": "company_123",
+                "channel_id": "channel_123",
+                "conversation_id": "5511999999999",
+                "message_id": "msg_123",
+                "conversation_seq": 42,
+                "trace_id": "trace_00000000000000000000000000",
+                "causation_id": null,
+                "correlation_id": "corr_00000000000000000000000000",
+                "occurred_at": "2026-05-02T00:00:00Z",
+                "produced_at": "2026-05-02T00:00:00Z",
+                "payload": payload_example
+            }
+        }]
+    })
 }
 
 fn add_openapi_paths(paths: &mut serde_json::Map<String, Value>) {
@@ -547,189 +943,178 @@ fn add_openapi_paths(paths: &mut serde_json::Map<String, Value>) {
             json!({"get": {"summary": "Prometheus metrics"}}),
         ),
         ("/docs", json!({"get": {"summary": "API docs"}})),
-        (
-            "/debug/kafka",
-            json!({"get": {"summary": "Kafka debug", "security": [{"bearerAuth": ["admin:*"]}]}}),
-        ),
+        ("/debug/kafka", json!({"get": {"summary": "Kafka debug"}})),
         (
             "/debug/kafka/deadletters",
-            json!({"get": {"summary": "List Kafka deadletters", "security": [{"bearerAuth": ["admin:*"]}]}}),
+            json!({"get": {"summary": "List Kafka deadletters"}}),
         ),
         (
             "/debug/kafka/deadletters/{deadletter_id}/replay",
-            json!({"post": {"summary": "Replay Kafka deadletter", "security": [{"bearerAuth": ["admin:*"]}]}}),
+            json!({"post": {"summary": "Replay Kafka deadletter"}}),
         ),
         (
             "/debug/dirty",
-            json!({"get": {"summary": "Debug dirty events", "security": [{"bearerAuth": ["admin:*"]}]}}),
+            json!({"get": {"summary": "Debug dirty events"}}),
         ),
         (
             "/debug/channels",
-            json!({"get": {"summary": "Debug channels", "security": [{"bearerAuth": ["admin:*"]}]}}),
+            json!({"get": {"summary": "Debug channels"}}),
         ),
         (
             "/dev-media/{media_id}",
             json!({"get": {"summary": "Development media preview"}}),
         ),
         (
-            "/v1/projects",
-            json!({"post": {"summary": "Create project", "security": [{"bearerAuth": ["projects:write"]}]}}),
+            "/v1/companies",
+            json!({"post": {"summary": "Create company"}}),
         ),
         (
-            "/v1/projects/{project_id}/api-keys",
-            json!({"post": {"summary": "Create API key", "security": [{"bearerAuth": ["projects:write"]}]}}),
+            "/v1/companies/{company_id}",
+            json!({"get": {"summary": "Get company"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies",
-            json!({"post": {"summary": "Create company", "security": [{"bearerAuth": ["companies:write"]}]}}),
+            "/v1/companies/{company_id}/channels/whatsapp/accounts",
+            json!({"post": {"summary": "Create WhatsApp account"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}",
-            json!({"get": {"summary": "Get company", "security": [{"bearerAuth": ["companies:read"]}]}}),
+            "/v1/companies/{company_id}/channels/whatsapp/accounts/{channel_id}",
+            json!({"get": {"summary": "Get WhatsApp account"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/channels/whatsapp/accounts",
-            json!({"post": {"summary": "Create WhatsApp account", "security": [{"bearerAuth": ["channels:write"]}]}}),
+            "/v1/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/connect",
+            json!({"post": {"summary": "Connect WhatsApp account"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/channels/whatsapp/accounts/{channel_id}",
-            json!({"get": {"summary": "Get WhatsApp account", "security": [{"bearerAuth": ["channels:read"]}]}}),
+            "/v1/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/disconnect",
+            json!({"post": {"summary": "Disconnect WhatsApp account"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/connect",
-            json!({"post": {"summary": "Connect WhatsApp account", "security": [{"bearerAuth": ["channels:write"]}]}}),
+            "/v1/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/qr",
+            json!({"get": {"summary": "Get WhatsApp QR"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/disconnect",
-            json!({"post": {"summary": "Disconnect WhatsApp account", "security": [{"bearerAuth": ["channels:write"]}]}}),
+            "/v1/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/pair-code",
+            json!({"post": {"summary": "Request pair code"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/qr",
-            json!({"get": {"summary": "Get WhatsApp QR", "security": [{"bearerAuth": ["channels:read"]}]}}),
+            "/v1/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/capabilities",
+            json!({"get": {"summary": "Get channel capabilities"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/pair-code",
-            json!({"post": {"summary": "Request pair code", "security": [{"bearerAuth": ["channels:write"]}]}}),
+            "/v1/companies/{company_id}/contacts/by-phone/{phone_e164}",
+            json!({"get": {"summary": "Get contact by phone"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/capabilities",
-            json!({"get": {"summary": "Get channel capabilities", "security": [{"bearerAuth": ["channels:read"]}]}}),
+            "/v1/companies/{company_id}/conversations/{conversation_id}",
+            json!({"get": {"summary": "Get conversation"}, "patch": {"summary": "Patch conversation"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/contacts/by-phone/{phone_e164}",
-            json!({"get": {"summary": "Get contact by phone", "security": [{"bearerAuth": ["contacts:read"]}]}}),
+            "/v1/companies/{company_id}/conversations/{conversation_id}/mark-read",
+            json!({"post": {"summary": "Mark conversation read"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/conversations/{conversation_id}",
-            json!({"get": {"summary": "Get conversation", "security": [{"bearerAuth": ["conversations:read"]}]}, "patch": {"summary": "Patch conversation", "security": [{"bearerAuth": ["conversations:read"]}]}}),
+            "/v1/companies/{company_id}/conversations/{conversation_id}/typing",
+            json!({"post": {"summary": "Send typing state"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/conversations/{conversation_id}/mark-read",
-            json!({"post": {"summary": "Mark conversation read", "security": [{"bearerAuth": ["messages:manage"]}]}}),
+            "/v1/companies/{company_id}/messages/{message_id}",
+            json!({"get": {"summary": "Get message"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/conversations/{conversation_id}/typing",
-            json!({"post": {"summary": "Send typing state", "security": [{"bearerAuth": ["messages:send"]}]}}),
+            "/v1/companies/{company_id}/messages/{message_id}/react",
+            json!({"post": {"summary": "React to message"}, "delete": {"summary": "Delete reaction"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/messages/{message_id}",
-            json!({"get": {"summary": "Get message", "security": [{"bearerAuth": ["messages:read"]}]}}),
+            "/v1/companies/{company_id}/messages/{message_id}/pin",
+            json!({"post": {"summary": "Pin message"}, "delete": {"summary": "Unpin message"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/messages/{message_id}/react",
-            json!({"post": {"summary": "React to message", "security": [{"bearerAuth": ["messages:manage"]}]}, "delete": {"summary": "Delete reaction", "security": [{"bearerAuth": ["messages:manage"]}]}}),
+            "/v1/companies/{company_id}/messages/{message_id}/star",
+            json!({"post": {"summary": "Star message"}, "delete": {"summary": "Unstar message"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/messages/{message_id}/pin",
-            json!({"post": {"summary": "Pin message", "security": [{"bearerAuth": ["messages:manage"]}]}, "delete": {"summary": "Unpin message", "security": [{"bearerAuth": ["messages:manage"]}]}}),
+            "/v1/companies/{company_id}/media/upload-outbound",
+            json!({"post": {"summary": "Upload outbound media"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/messages/{message_id}/star",
-            json!({"post": {"summary": "Star message", "security": [{"bearerAuth": ["messages:manage"]}]}, "delete": {"summary": "Unstar message", "security": [{"bearerAuth": ["messages:manage"]}]}}),
+            "/v1/companies/{company_id}/media/{media_id}",
+            json!({"get": {"summary": "Get media"}, "delete": {"summary": "Delete media"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/media/upload-outbound",
-            json!({"post": {"summary": "Upload outbound media", "security": [{"bearerAuth": ["media:write"]}]}}),
+            "/v1/companies/{company_id}/media/{media_id}/download-url",
+            json!({"get": {"summary": "Get media download URL"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/media/{media_id}",
-            json!({"get": {"summary": "Get media", "security": [{"bearerAuth": ["media:read"]}]}, "delete": {"summary": "Delete media", "security": [{"bearerAuth": ["media:write"]}]}}),
+            "/v1/companies/{company_id}/media/{media_id}/save",
+            json!({"post": {"summary": "Save media permanently"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/media/{media_id}/download-url",
-            json!({"get": {"summary": "Get media download URL", "security": [{"bearerAuth": ["media:read"]}]}}),
+            "/v1/companies/{company_id}/messages/{message_id}/transcript",
+            json!({"get": {"summary": "Get transcript"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/media/{media_id}/save",
-            json!({"post": {"summary": "Save media permanently", "security": [{"bearerAuth": ["media:write"]}]}}),
+            "/v1/companies/{company_id}/messages/{message_id}/transcribe",
+            json!({"post": {"summary": "Request transcription"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/messages/{message_id}/transcript",
-            json!({"get": {"summary": "Get transcript", "security": [{"bearerAuth": ["transcripts:read"]}]}}),
+            "/v1/companies/{company_id}/groups/{group_id}/exit",
+            json!({"post": {"summary": "Exit group"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/messages/{message_id}/transcribe",
-            json!({"post": {"summary": "Request transcription", "security": [{"bearerAuth": ["transcripts:write"]}]}}),
+            "/v1/companies/{company_id}/groups/{group_id}/members/{contact_id}",
+            json!({"delete": {"summary": "Remove group member"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/exit",
-            json!({"post": {"summary": "Exit group", "security": [{"bearerAuth": ["groups:manage"]}]}}),
+            "/v1/companies/{company_id}/groups/{group_id}/members/{contact_id}/promote",
+            json!({"post": {"summary": "Promote group member"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/members/{contact_id}",
-            json!({"delete": {"summary": "Remove group member", "security": [{"bearerAuth": ["groups:manage"]}]}}),
+            "/v1/companies/{company_id}/groups/{group_id}/members/{contact_id}/demote",
+            json!({"post": {"summary": "Demote group member"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/members/{contact_id}/promote",
-            json!({"post": {"summary": "Promote group member", "security": [{"bearerAuth": ["groups:manage"]}]}}),
+            "/v1/companies/{company_id}/groups/{group_id}/join-requests/{request_id}/accept",
+            json!({"post": {"summary": "Accept join request"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/members/{contact_id}/demote",
-            json!({"post": {"summary": "Demote group member", "security": [{"bearerAuth": ["groups:manage"]}]}}),
+            "/v1/companies/{company_id}/groups/{group_id}/join-requests/{request_id}/reject",
+            json!({"post": {"summary": "Reject join request"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/join-requests/{request_id}/accept",
-            json!({"post": {"summary": "Accept join request", "security": [{"bearerAuth": ["groups:manage"]}]}}),
+            "/v1/companies/{company_id}/dirty-conversations/{conversation_id}/ack",
+            json!({"post": {"summary": "Ack dirty conversation"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/join-requests/{request_id}/reject",
-            json!({"post": {"summary": "Reject join request", "security": [{"bearerAuth": ["groups:manage"]}]}}),
+            "/v1/companies/{company_id}/consumer-callbacks/{callback_id}",
+            json!({"patch": {"summary": "Update callback"}, "delete": {"summary": "Delete callback"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/dirty-conversations/{conversation_id}/ack",
-            json!({"post": {"summary": "Ack dirty conversation", "security": [{"bearerAuth": ["dirty:ack"]}]}}),
+            "/v1/dev/companies/{company_id}/simulate/inbound-text",
+            json!({"post": {"summary": "Simulate inbound text"}}),
         ),
         (
-            "/v1/projects/{project_id}/companies/{company_id}/consumer-callbacks/{callback_id}",
-            json!({"patch": {"summary": "Update callback", "security": [{"bearerAuth": ["admin:*"]}]}, "delete": {"summary": "Delete callback", "security": [{"bearerAuth": ["admin:*"]}]}}),
+            "/v1/dev/companies/{company_id}/simulate/inbound-audio",
+            json!({"post": {"summary": "Simulate inbound audio"}}),
         ),
         (
-            "/v1/dev/projects/{project_id}/companies/{company_id}/simulate/inbound-text",
-            json!({"post": {"summary": "Simulate inbound text", "security": [{"bearerAuth": ["dev:simulate"]}]}}),
+            "/v1/dev/companies/{company_id}/simulate/inbound-image",
+            json!({"post": {"summary": "Simulate inbound image"}}),
         ),
         (
-            "/v1/dev/projects/{project_id}/companies/{company_id}/simulate/inbound-audio",
-            json!({"post": {"summary": "Simulate inbound audio", "security": [{"bearerAuth": ["dev:simulate"]}]}}),
+            "/v1/dev/companies/{company_id}/simulate/receipt",
+            json!({"post": {"summary": "Simulate receipt"}}),
         ),
         (
-            "/v1/dev/projects/{project_id}/companies/{company_id}/simulate/inbound-image",
-            json!({"post": {"summary": "Simulate inbound image", "security": [{"bearerAuth": ["dev:simulate"]}]}}),
+            "/v1/dev/companies/{company_id}/simulate/qr-rotate",
+            json!({"post": {"summary": "Rotate dev QR"}}),
         ),
         (
-            "/v1/dev/projects/{project_id}/companies/{company_id}/simulate/receipt",
-            json!({"post": {"summary": "Simulate receipt", "security": [{"bearerAuth": ["dev:simulate"]}]}}),
+            "/v1/dev/companies/{company_id}/simulate/group-event",
+            json!({"post": {"summary": "Simulate group event"}}),
         ),
         (
-            "/v1/dev/projects/{project_id}/companies/{company_id}/simulate/qr-rotate",
-            json!({"post": {"summary": "Rotate dev QR", "security": [{"bearerAuth": ["dev:simulate"]}]}}),
-        ),
-        (
-            "/v1/dev/projects/{project_id}/companies/{company_id}/simulate/group-event",
-            json!({"post": {"summary": "Simulate group event", "security": [{"bearerAuth": ["dev:simulate"]}]}}),
-        ),
-        (
-            "/v1/dev/projects/{project_id}/companies/{company_id}/simulate/reset",
-            json!({"post": {"summary": "Reset dev state", "security": [{"bearerAuth": ["dev:simulate"]}]}}),
+            "/v1/dev/companies/{company_id}/simulate/reset",
+            json!({"post": {"summary": "Reset dev state"}}),
         ),
     ] {
         paths.entry(path.to_string()).or_insert(methods);
@@ -898,7 +1283,7 @@ async fn dev_media_preview(
                     created_at: media.created_at,
                     updated_at: media.updated_at,
                 });
-            if let Ok(Some((media, bytes))) = state.media_blob(&media_id) {
+            if let Ok(Some((media, bytes))) = state.media_blob(&media_id).await {
                 ([(header::CONTENT_TYPE, media.mime_type)], bytes).into_response()
             } else {
                 (
@@ -917,84 +1302,23 @@ async fn dev_media_preview(
     }
 }
 
-async fn create_project(
-    headers: HeaderMap,
-    State(state): State<AppState>,
-    Json(req): Json<ProjectRequest>,
-) -> ApiResult<Json<Value>> {
-    authorize(&state.config, &headers, "projects:write")?;
-    let id = req
-        .id
-        .unwrap_or_else(|| req.name.to_lowercase().replace(' ', "_"));
-    Ok(Json(state.upsert_project(id, req.name)))
-}
-
-async fn create_api_key(
-    headers: HeaderMap,
-    Path(path): Path<ProjectPath>,
-    State(state): State<AppState>,
-) -> ApiResult<Json<Value>> {
-    authorize_project(&state.config, &headers, "projects:write", &path.project_id)?;
-    let (plaintext, key_hash, key_id) = generate_api_key();
-    let scopes: Vec<String> = [
-        "channels:read",
-        "channels:write",
-        "contacts:read",
-        "conversations:read",
-        "messages:read",
-        "messages:send",
-        "messages:manage",
-        "media:read",
-        "media:write",
-        "transcripts:read",
-        "transcripts:write",
-        "groups:read",
-        "groups:manage",
-        "dirty:read",
-        "dirty:ack",
-        "websocket:connect",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect();
-    let metadata = state.store_api_key_metadata(
-        &path.project_id,
-        None,
-        &key_id,
-        &key_hash,
-        &scopes,
-        "default",
-    );
-    register_project_api_key(
-        key_hash,
-        key_id,
-        path.project_id.clone(),
-        None,
-        scopes.iter().cloned().collect::<HashSet<_>>(),
-        false,
-    );
-    Ok(Json(json!({
-        "project_id": path.project_id,
-        "api_key": plaintext,
-        "key": plaintext,
-        "metadata": metadata,
-        "scopes": scopes
-    })))
-}
-
 async fn create_company(
     headers: HeaderMap,
-    Path(path): Path<ProjectPath>,
     State(state): State<AppState>,
     Json(req): Json<CompanyRequest>,
 ) -> ApiResult<Json<Value>> {
-    authorize_project(&state.config, &headers, "companies:write", &path.project_id)?;
+    let project_id = crate::models::INTERNAL_PROJECT_ID;
+    authorize_project(&state.config, &headers, "companies:write", project_id)?;
     let id = req.id.unwrap_or_else(|| {
         req.external_company_id
             .clone()
             .unwrap_or_else(|| "company_dev".to_string())
     });
-    Ok(Json(state.upsert_company(path.project_id, id, req.name)))
+    Ok(Json(state.upsert_company(
+        project_id.to_string(),
+        id,
+        req.name,
+    )))
 }
 
 async fn get_company(
@@ -1171,20 +1495,20 @@ async fn get_contact(
 
 async fn get_contact_by_phone(
     headers: HeaderMap,
-    Path((project_id, company_id, phone_e164)): Path<(String, String, String)>,
+    Path(path): Path<ProjectCompanyContactPhonePath>,
     State(state): State<AppState>,
 ) -> ApiResult<Json<Value>> {
     authorize_company(
         &state.config,
         &headers,
         "contacts:read",
-        &project_id,
-        &company_id,
+        &path.project_id,
+        &path.company_id,
     )?;
     Ok(Json(state.contact_by_phone(
-        &project_id,
-        &company_id,
-        &phone_e164,
+        &path.project_id,
+        &path.company_id,
+        &path.phone_e164,
     )?))
 }
 
@@ -1273,13 +1597,16 @@ async fn patch_conversation(
     authorize_company(
         &state.config,
         &headers,
-        "conversations:read",
+        "conversations:write",
         &path.project_id,
         &path.company_id,
     )?;
-    Ok(Json(
-        json!({"conversation_id": path.conversation_id, "updated": body}),
-    ))
+    Ok(Json(json!(state.patch_conversation_metadata(
+        &path.project_id,
+        &path.company_id,
+        &path.conversation_id,
+        &body,
+    )?)))
 }
 
 async fn list_messages(
@@ -1340,20 +1667,30 @@ async fn send_message(
         max_per_minute: state.config.rate_limits.send_message_per_minute_per_channel,
     })?;
     let idempotency_key = idempotency_key(&headers)?;
+    let actor_id = actor_id(&headers);
     let outcome = state.prepare_send_message(
         &path.project_id,
         &path.company_id,
         &path.conversation_id,
         &idempotency_key,
         req,
+        actor_id,
     )?;
+    let public_conversation_id = state.public_conversation_id_for_ref(
+        &path.project_id,
+        &path.company_id,
+        &outcome.message.conversation_id,
+    );
+    let mut response_message = outcome.message.clone();
+    response_message.conversation_id = public_conversation_id;
     Ok((
         StatusCode::ACCEPTED,
         Json(json!({
             "accepted": true,
             "command_id": outcome.message.id,
-            "message": outcome.message,
-            "status": "queued"
+            "message": response_message,
+            "status": "queued",
+            "delivery_state": outcome.message.delivery_state()
         })),
     ))
 }
@@ -1467,7 +1804,12 @@ async fn typing(
         &path.project_id,
         &path.company_id,
     )?;
-    Ok(Json(json!({"typing": true})))
+    let conversation =
+        state.conversation(&path.project_id, &path.company_id, &path.conversation_id)?;
+    Err(ApiError::NotSupported(format!(
+        "typing indicators require an active WhatsApp provider channel {}; local-only typing success is disabled",
+        conversation.channel_account_id
+    )))
 }
 
 async fn get_message(
@@ -1785,10 +2127,8 @@ async fn download_url(
         &path.company_id,
     )?;
     let media = state.media_for_company(&path.project_id, &path.company_id, &path.media_id)?;
-    let url = media
-        .object_key
-        .as_deref()
-        .and_then(|object_key| {
+    let url = if state.config.storage_provider == crate::config::StorageProvider::R2 {
+        media.object_key.as_deref().and_then(|object_key| {
             presigned_r2_get_url(
                 &state.config.r2,
                 object_key,
@@ -1797,15 +2137,24 @@ async fn download_url(
             .ok()
             .flatten()
         })
-        .or(media.public_url.clone())
-        .or(media.thumbnail_url.clone())
-        .or_else(|| {
-            media
-                .object_key
-                .as_deref()
-                .and_then(|object_key| state.config.public_object_url(object_key))
-        })
-        .unwrap_or_else(|| state.config.dev_media_url(&media.id));
+    } else {
+        None
+    }
+    .or_else(|| {
+        media
+            .object_key
+            .as_deref()
+            .and_then(|object_key| state.config.public_object_url(object_key))
+    })
+    .or_else(|| {
+        media
+            .object_key
+            .as_ref()
+            .map(|_| state.config.dev_media_url(&media.id))
+    })
+    .or(media.public_url.clone())
+    .or(media.thumbnail_url.clone())
+    .unwrap_or_else(|| state.config.dev_media_url(&media.id));
     Ok(Json(
         json!({"media_id": path.media_id, "url": url, "ttl_seconds": state.config.r2_presigned_url_ttl_seconds}),
     ))
@@ -1847,9 +2196,9 @@ async fn save_media(
             media_id: &path.media_id,
             ext: "bin",
         });
-        copy_r2_object(&state.config.r2, source, &destination)
-            .await
-            .map_err(ApiError::ProviderError)?;
+        state
+            .copy_media_bytes(source, &destination, &before.mime_type)
+            .await?;
         state.save_media_with_permanent_object_key_for_company(
             &path.project_id,
             &path.company_id,
@@ -1884,14 +2233,10 @@ async fn delete_media(
     )?;
     let before = state.media_for_company(&path.project_id, &path.company_id, &path.media_id)?;
     if let Some(object_key) = before.object_key.as_deref() {
-        delete_r2_object(&state.config.r2, object_key)
-            .await
-            .map_err(ApiError::ProviderError)?;
+        state.delete_media_bytes(object_key).await?;
     }
     if let Some(object_key) = before.permanent_object_key.as_deref() {
-        delete_r2_object(&state.config.r2, object_key)
-            .await
-            .map_err(ApiError::ProviderError)?;
+        state.delete_media_bytes(object_key).await?;
     }
     let media =
         state.delete_media_for_company(&path.project_id, &path.company_id, &path.media_id)?;
@@ -2174,19 +2519,18 @@ async fn demote_group_member(
 
 async fn accept_join_request(
     headers: HeaderMap,
-    Path(path): Path<(String, String, String, String)>,
+    Path(path): Path<ProjectCompanyGroupJoinRequestPath>,
     State(state): State<AppState>,
 ) -> ApiResult<Json<Value>> {
-    let (project_id, company_id, group_id, _) = path;
     authorize_company(
         &state.config,
         &headers,
         "groups:manage",
-        &project_id,
-        &company_id,
+        &path.project_id,
+        &path.company_id,
     )?;
     state
-        .inspect_group(&project_id, &company_id, &group_id)
+        .inspect_group(&path.project_id, &path.company_id, &path.group_id)
         .await?;
     Err(ApiError::NotSupported(
         "group join request accept is not supported by the active WhatsApp adapter".to_string(),
@@ -2195,19 +2539,18 @@ async fn accept_join_request(
 
 async fn reject_join_request(
     headers: HeaderMap,
-    Path(path): Path<(String, String, String, String)>,
+    Path(path): Path<ProjectCompanyGroupJoinRequestPath>,
     State(state): State<AppState>,
 ) -> ApiResult<Json<Value>> {
-    let (project_id, company_id, group_id, _) = path;
     authorize_company(
         &state.config,
         &headers,
         "groups:manage",
-        &project_id,
-        &company_id,
+        &path.project_id,
+        &path.company_id,
     )?;
     state
-        .inspect_group(&project_id, &company_id, &group_id)
+        .inspect_group(&path.project_id, &path.company_id, &path.group_id)
         .await?;
     Err(ApiError::NotSupported(
         "group join request reject is not supported by the active WhatsApp adapter".to_string(),
@@ -2230,9 +2573,14 @@ async fn list_dirty(
     let limit = query.limit();
     let consumer_id = query
         .consumer_id
-        .unwrap_or_else(|| "dev_tester".to_string());
+        .as_deref()
+        .map(str::trim)
+        .filter(|consumer_id| !consumer_id.is_empty())
+        .ok_or_else(|| {
+            ApiError::BadRequest("consumer_id query parameter is required".to_string())
+        })?;
     Ok(Json(json!(DirtyListResponse {
-        items: state.list_dirty(&path.project_id, &path.company_id, &consumer_id, limit)
+        items: state.list_dirty(&path.project_id, &path.company_id, consumer_id, limit)
     })))
 }
 
@@ -2306,52 +2654,60 @@ async fn create_callback(
         &path.company_id,
         None,
         body,
-    )))
+    )?))
 }
 
 async fn update_callback(
     headers: HeaderMap,
-    Path(path): Path<(String, String, String)>,
+    Path(path): Path<ProjectCompanyCallbackPath>,
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> ApiResult<Json<Value>> {
-    let (project_id, company_id, callback_id) = path;
-    let principal =
-        authorize_company(&state.config, &headers, "admin:*", &project_id, &company_id)?;
+    let principal = authorize_company(
+        &state.config,
+        &headers,
+        "admin:*",
+        &path.project_id,
+        &path.company_id,
+    )?;
     enforce_admin_rate_limit(
         &state,
         &headers,
         &principal.api_key_id,
-        &project_id,
-        &company_id,
+        &path.project_id,
+        &path.company_id,
     )?;
     Ok(Json(state.upsert_callback(
-        &project_id,
-        &company_id,
-        Some(&callback_id),
+        &path.project_id,
+        &path.company_id,
+        Some(&path.callback_id),
         body,
-    )))
+    )?))
 }
 
 async fn delete_callback(
     headers: HeaderMap,
-    Path(path): Path<(String, String, String)>,
+    Path(path): Path<ProjectCompanyCallbackPath>,
     State(state): State<AppState>,
 ) -> ApiResult<Json<Value>> {
-    let (project_id, company_id, callback_id) = path;
-    let principal =
-        authorize_company(&state.config, &headers, "admin:*", &project_id, &company_id)?;
+    let principal = authorize_company(
+        &state.config,
+        &headers,
+        "admin:*",
+        &path.project_id,
+        &path.company_id,
+    )?;
     enforce_admin_rate_limit(
         &state,
         &headers,
         &principal.api_key_id,
-        &project_id,
-        &company_id,
+        &path.project_id,
+        &path.company_id,
     )?;
     Ok(Json(state.delete_callback(
-        &project_id,
-        &company_id,
-        &callback_id,
+        &path.project_id,
+        &path.company_id,
+        &path.callback_id,
     )?))
 }
 
@@ -2479,7 +2835,7 @@ async fn dev_inbound_audio(
     req.media_type = Some("audio".to_string());
     req.mime_type = Some(req.mime_type.unwrap_or_else(|| "audio/ogg".to_string()));
     let (message, media, transcript) =
-        state.receive_inbound_media(&path.project_id, &path.company_id, req);
+        state.try_receive_inbound_media(&path.project_id, &path.company_id, req)?;
     Ok(Json(
         json!({"message": message, "media": media, "transcript": transcript}),
     ))
@@ -2502,7 +2858,7 @@ async fn dev_inbound_image(
     req.media_type = Some(req.media_type.unwrap_or_else(|| "image".to_string()));
     req.mime_type = Some(req.mime_type.unwrap_or_else(|| "image/png".to_string()));
     let (message, media, transcript) =
-        state.receive_inbound_media(&path.project_id, &path.company_id, req);
+        state.try_receive_inbound_media(&path.project_id, &path.company_id, req)?;
     Ok(Json(
         json!({"message": message, "media": media, "transcript": transcript}),
     ))
@@ -2625,16 +2981,11 @@ async fn dev_reset(
 
 async fn websocket_handler(
     headers: HeaderMap,
-    Query(query): Query<HashMap<String, String>>,
+    Query(_query): Query<HashMap<String, String>>,
     State(state): State<AppState>,
     ws: WebSocketUpgrade,
 ) -> ApiResult<Response> {
-    let token = query
-        .get("token")
-        .cloned()
-        .or_else(|| crate::security::bearer_token(&headers))
-        .ok_or_else(|| ApiError::Unauthorized("missing websocket token".to_string()))?;
-    let principal = authorize_token(&state.config, &token, "websocket:connect")?;
+    let principal = authorize(&state.config, &headers, "websocket:connect")?;
     Ok(ws.on_upgrade(move |socket| websocket_session(socket, state, principal)))
 }
 
@@ -2815,22 +3166,6 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    fn register_route_key(
-        token: &str,
-        project_id: &str,
-        company_id: Option<&str>,
-        scopes: &[&str],
-    ) {
-        register_project_api_key(
-            crate::security::sha256_hex(token),
-            format!("key_{token}"),
-            project_id.to_string(),
-            company_id.map(str::to_string),
-            scopes.iter().map(|scope| (*scope).to_string()).collect(),
-            false,
-        );
-    }
-
     async fn spawn_ws_server(state: AppState) -> (String, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2862,8 +3197,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1/projects/p/companies/c/conversations/conv/messages")
-                    .header("Authorization", "Bearer dev_project_key")
+                    .uri("/v1/companies/c/conversations/conv/messages")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"type":"text","text":"oi"}"#))
                     .unwrap(),
@@ -2880,7 +3214,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/v1/projects/p/companies/c/conversations")
+                    .uri("/v1/companies/c/messages/missing_message")
                     .header("X-Request-Id", "req_test_123")
                     .body(Body::empty())
                     .unwrap(),
@@ -2888,7 +3222,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
         let header = res
             .headers()
             .get("X-Request-Id")
@@ -2913,8 +3247,7 @@ mod tests {
                 .oneshot(
                     Request::builder()
                         .method("POST")
-                        .uri("/v1/projects/p/companies/c/conversations/conv/messages")
-                        .header("Authorization", "Bearer dev_project_key")
+                        .uri("/v1/companies/c/conversations/conv/messages")
                         .header("Idempotency-Key", idem)
                         .header("content-type", "application/json")
                         .body(Body::from(r#"{"type":"text","text":"oi"}"#))
@@ -2932,6 +3265,110 @@ mod tests {
                 assert!(parsed["error"]["request_id"].as_str().is_some());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn m2m_company_route_sends_without_authorization_and_records_actor() {
+        let state = AppState::new(crate::config::AppConfig::from_env());
+        let app = build_router(state.clone());
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/companies/company_m2m/conversations/conv_m2m/messages")
+                    .header("Idempotency-Key", "m2m-send-actor")
+                    .header("X-RustZap-Actor-Id", "ai-agent-7")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"type":"text","text":"oi"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["message"]["sent_by_external_user_id"], "ai-agent-7");
+        assert_eq!(parsed["message"]["delivery_state"], "pending");
+        assert_eq!(parsed["delivery_state"], "pending");
+        assert_eq!(
+            state.conversations("rustzap_internal", "company_m2m").len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn m2m_company_route_reads_without_authorization() {
+        let state = AppState::new(crate::config::AppConfig::from_env());
+        state.receive_inbound_text(
+            "rustzap_internal",
+            "company_m2m_read",
+            SimulateInboundTextRequest {
+                conversation_id: Some("5511999999999@s.whatsapp.net".to_string()),
+                channel_id: Some("ch".to_string()),
+                from_phone_e164: Some("+5511999999999".to_string()),
+                sender_name: Some("Cliente".to_string()),
+                profile_picture_url: None,
+                text: "oi".to_string(),
+            },
+        );
+        let app = build_router(state);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/companies/company_m2m_read/conversations/5511999999999@s.whatsapp.net/messages")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["messages"][0]["status"], "received");
+        assert_eq!(parsed["messages"][0]["delivery_state"], "not_applicable");
+    }
+
+    #[tokio::test]
+    async fn m2m_company_route_reads_with_numberonly_conversation_id() {
+        let state = AppState::new(crate::config::AppConfig::from_env());
+        state.receive_inbound_text(
+            "rustzap_internal",
+            "company_m2m_numberonly",
+            SimulateInboundTextRequest {
+                conversation_id: Some("5511999999999@s.whatsapp.net".to_string()),
+                channel_id: Some("ch".to_string()),
+                from_phone_e164: Some("+5511999999999".to_string()),
+                sender_name: Some("Cliente".to_string()),
+                profile_picture_url: None,
+                text: "oi".to_string(),
+            },
+        );
+        let app = build_router(state);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(
+                        "/v1/companies/company_m2m_numberonly/conversations/5511999999999/messages",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["conversation_id"], "5511999999999");
+        assert_eq!(parsed["messages"][0]["conversation_id"], "5511999999999");
+        assert_eq!(parsed["messages"][0]["status"], "received");
     }
 
     #[tokio::test]
@@ -2954,62 +3391,281 @@ mod tests {
 
         for path in [
             "/metrics",
-            "/v1/projects",
-            "/v1/projects/{project_id}/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/capabilities",
-            "/v1/projects/{project_id}/companies/{company_id}/media/upload-outbound",
-            "/v1/projects/{project_id}/companies/{company_id}/media/{media_id}/download-url",
-            "/v1/projects/{project_id}/companies/{company_id}/messages/{message_id}/transcribe",
-            "/v1/projects/{project_id}/companies/{company_id}/groups/{group_id}/exit",
-            "/v1/projects/{project_id}/companies/{company_id}/dirty-conversations/{conversation_id}/ack",
-            "/v1/dev/projects/{project_id}/companies/{company_id}/simulate/inbound-audio",
+            "/v1/companies",
+            "/v1/companies/{company_id}/channels/whatsapp/accounts/{channel_id}/capabilities",
+            "/v1/companies/{company_id}/media/upload-outbound",
+            "/v1/companies/{company_id}/media/{media_id}/download-url",
+            "/v1/companies/{company_id}/messages/{message_id}/transcribe",
+            "/v1/companies/{company_id}/groups/{group_id}/exit",
+            "/v1/companies/{company_id}/dirty-conversations/{conversation_id}/ack",
+            "/v1/dev/companies/{company_id}/simulate/inbound-audio",
         ] {
             assert!(paths.contains_key(path), "OpenAPI missing {path}");
         }
     }
 
     #[tokio::test]
-    async fn company_scoped_key_cannot_read_other_tenant_conversations() {
-        let token = "route_company_read_tenant_key";
-        register_route_key(
-            token,
-            "project_a",
-            Some("company_a"),
-            &["conversations:read"],
-        );
+    async fn openapi_documents_m2m_cursor_idempotency_and_error_contracts() {
         let app = build_router(AppState::new(crate::config::AppConfig::from_env()));
-
-        let forbidden = app
-            .clone()
+        let response = app
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/v1/projects/project_b/companies/company_b/conversations")
-                    .header("Authorization", format!("Bearer {token}"))
+                    .uri("/openapi.json")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let spec: Value = serde_json::from_slice(&body).unwrap();
 
-        let allowed = app
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri("/v1/projects/project_a/companies/company_a/conversations")
-                    .header("Authorization", format!("Bearer {token}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(allowed.status(), StatusCode::OK);
+        for schema in [
+            "CommonEvent",
+            "DirtyAckRequest",
+            "DirtyConversationItem",
+            "DirtyListResponse",
+            "MessagesPage",
+            "SendMessageRequest",
+        ] {
+            assert!(
+                spec["components"]["schemas"].get(schema).is_some(),
+                "OpenAPI missing schema {schema}"
+            );
+        }
+
+        let messages =
+            &spec["paths"]["/v1/companies/{company_id}/conversations/{conversation_id}/messages"];
+        let get_parameters = messages["get"]["parameters"].as_array().unwrap();
+        for name in ["after_seq", "before_seq", "limit"] {
+            assert!(
+                get_parameters
+                    .iter()
+                    .any(|parameter| parameter["name"] == name && parameter["in"] == "query"),
+                "GET messages missing query parameter {name}"
+            );
+        }
+        assert!(
+            messages["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+                == "#/components/schemas/MessagesPage"
+        );
+        assert!(messages["get"]["responses"].get("default").is_some());
+
+        let post_parameters = messages["post"]["parameters"].as_array().unwrap();
+        assert!(post_parameters.iter().any(|parameter| {
+            parameter["name"] == "Idempotency-Key"
+                && parameter["in"] == "header"
+                && parameter["required"] == true
+        }));
+        assert!(
+            messages["post"]["requestBody"]["content"]["application/json"]["schema"]["$ref"]
+                == "#/components/schemas/SendMessageRequest"
+        );
+        assert!(messages["post"]["responses"].get("202").is_some());
+        assert!(messages["post"]["responses"].get("409").is_some());
+
+        let dirty = &spec["paths"]["/v1/companies/{company_id}/dirty-conversations"];
+        assert!(dirty["get"]["parameters"].as_array().unwrap().iter().any(
+            |parameter| parameter["name"] == "consumer_id"
+                && parameter["in"] == "query"
+                && parameter["required"] == true
+        ));
+        assert!(
+            dirty["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+                == "#/components/schemas/DirtyListResponse"
+        );
+
+        let ack = &spec["paths"]["/v1/companies/{company_id}/dirty-conversations/{conversation_id}/ack"]
+            ["post"];
+        assert!(
+            ack["requestBody"]["content"]["application/json"]["schema"]["$ref"]
+                == "#/components/schemas/DirtyAckRequest"
+        );
     }
 
     #[tokio::test]
-    async fn company_scoped_key_cannot_send_message_to_other_tenant() {
-        let token = "route_company_send_tenant_key";
-        register_route_key(token, "project_a", Some("company_a"), &["messages:send"]);
+    async fn asyncapi_documents_compact_kafka_events_and_partition_keys() {
+        let app = build_router(AppState::new(crate::config::AppConfig::from_env()));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/asyncapi.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let spec: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(spec["asyncapi"], "3.0.0");
+        let common_event = &spec["components"]["schemas"]["CommonEvent"];
+        for field in [
+            "event_id",
+            "event_type",
+            "project_id",
+            "company_id",
+            "channel_id",
+            "conversation_id",
+            "message_id",
+            "conversation_seq",
+            "trace_id",
+            "correlation_id",
+            "occurred_at",
+            "payload",
+        ] {
+            assert!(
+                common_event["properties"].get(field).is_some(),
+                "AsyncAPI CommonEvent missing {field}"
+            );
+        }
+
+        for event_type in [
+            "conversation.dirty",
+            "message.receipt",
+            "channel.status",
+            "channel.qr",
+            "group.updated",
+            "media.stored",
+            "transcript.completed",
+        ] {
+            assert!(
+                spec["components"]["messages"].get(event_type).is_some(),
+                "AsyncAPI missing message {event_type}"
+            );
+        }
+
+        assert_eq!(
+            spec["components"]["x-partition-keys"]["conversation"],
+            "{project_id}:{company_id}:{conversation_id}"
+        );
+        assert_eq!(
+            spec["components"]["x-partition-keys"]["channel"],
+            "{project_id}:{company_id}:{channel_id}"
+        );
+    }
+
+    #[tokio::test]
+    async fn typing_route_returns_not_supported_instead_of_fake_success() {
+        let state = AppState::new(crate::config::AppConfig::from_env());
+        state.receive_inbound_text(
+            "rustzap_internal",
+            "company_typing",
+            SimulateInboundTextRequest {
+                conversation_id: Some("conv".to_string()),
+                channel_id: Some("ch".to_string()),
+                from_phone_e164: None,
+                sender_name: None,
+                profile_picture_url: None,
+                text: "oi".to_string(),
+            },
+        );
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/companies/company_typing/conversations/conv/typing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["error"]["code"], "not_supported");
+    }
+
+    #[tokio::test]
+    async fn patch_conversation_updates_local_metadata_instead_of_echoing_body() {
+        let state = AppState::new(crate::config::AppConfig::from_env());
+        state.receive_inbound_text(
+            "rustzap_internal",
+            "company_patch",
+            SimulateInboundTextRequest {
+                conversation_id: Some("conv".to_string()),
+                channel_id: Some("ch".to_string()),
+                from_phone_e164: None,
+                sender_name: None,
+                profile_picture_url: None,
+                text: "oi".to_string(),
+            },
+        );
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/v1/companies/company_patch/conversations/conv")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"is_archived":true,"is_muted":true,"control_mode":"autopilot"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["id"], "conv");
+        assert_eq!(parsed["is_archived"], true);
+        assert_eq!(parsed["is_muted"], true);
+        assert_eq!(parsed["control_mode"], "autopilot");
+        assert!(
+            parsed.get("updated").is_none(),
+            "route must not echo fake success"
+        );
+    }
+
+    #[tokio::test]
+    async fn dirty_list_requires_explicit_consumer_id() {
+        let app = build_router(AppState::new(crate::config::AppConfig::from_env()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/companies/company_dirty/dirty-conversations")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["error"]["code"], "bad_request");
+    }
+
+    #[tokio::test]
+    async fn company_context_is_trusted_for_reads() {
+        let app = build_router(AppState::new(crate::config::AppConfig::from_env()));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/companies/company_b/conversations")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn company_context_is_trusted_for_sends() {
         let state = AppState::new(crate::config::AppConfig::from_env());
         let app = build_router(state.clone());
 
@@ -3017,8 +3673,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1/projects/project_b/companies/company_b/conversations/conv/messages")
-                    .header("Authorization", format!("Bearer {token}"))
+                    .uri("/v1/companies/company_b/conversations/conv/messages")
                     .header("Idempotency-Key", "cross-tenant-send")
                     .header("content-type", "application/json")
                     .body(Body::from(r#"{"type":"text","text":"blocked"}"#))
@@ -3027,30 +3682,28 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        assert!(state.conversations("project_b", "company_b").is_empty());
-    }
-
-    #[tokio::test]
-    async fn websocket_token_without_auth_fails() {
-        let config = crate::config::AppConfig::from_env();
-        let err = crate::security::authorize_token(&config, "bad_token", "websocket:connect")
-            .unwrap_err();
-        assert!(matches!(err, ApiError::Unauthorized(_)));
-    }
-
-    #[tokio::test]
-    async fn websocket_tenant_key_rejects_cross_tenant_subscribe() {
-        let token = "ws_cross_tenant_subscribe_key";
-        register_route_key(
-            token,
-            "project_a",
-            Some("company_a"),
-            &["websocket:connect"],
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            state
+                .conversations(crate::models::INTERNAL_PROJECT_ID, "company_b")
+                .len(),
+            1
         );
+    }
+
+    #[tokio::test]
+    async fn websocket_token_authorization_is_internal_trust() {
+        let config = crate::config::AppConfig::from_env();
+        let principal =
+            crate::security::authorize_token(&config, "bad_token", "websocket:connect").unwrap();
+        assert!(crate::security::has_scope(&principal.scopes, "admin:*"));
+    }
+
+    #[tokio::test]
+    async fn websocket_trusts_subscribe_tenant_context() {
         let (url, server) =
             spawn_ws_server(AppState::new(crate::config::AppConfig::from_env())).await;
-        let (mut socket, _) = connect_async(format!("{url}?token={token}")).await.unwrap();
+        let (mut socket, _) = connect_async(url).await.unwrap();
 
         socket
             .send(TungsteniteMessage::Text(
@@ -3067,21 +3720,15 @@ mod tests {
             .unwrap();
 
         let response = read_ws_json(&mut socket).await;
-        assert_eq!(response["type"], "error");
-        assert_eq!(response["error"]["code"], "forbidden");
+        assert_eq!(response["type"], "subscribed");
+        assert_eq!(response["project_id"], "project_b");
+        assert_eq!(response["company_id"], "company_b");
 
         server.abort();
     }
 
     #[tokio::test]
-    async fn websocket_tenant_key_receives_only_authorized_snapshot_and_stream_events() {
-        let token = "ws_authorized_events_key";
-        register_route_key(
-            token,
-            "project_a",
-            Some("company_a"),
-            &["websocket:connect"],
-        );
+    async fn websocket_receives_only_subscribed_company_snapshot_and_stream_events() {
         let state = AppState::new(crate::config::AppConfig::from_env());
         state.push_event(eventbus::new_event(
             "message.received",
@@ -3104,7 +3751,7 @@ mod tests {
             json!({}),
         ));
         let (url, server) = spawn_ws_server(state.clone()).await;
-        let (mut socket, _) = connect_async(format!("{url}?token={token}")).await.unwrap();
+        let (mut socket, _) = connect_async(url).await.unwrap();
 
         socket
             .send(TungsteniteMessage::Text(
@@ -3162,8 +3809,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/v1/projects/p/companies/c/channels/whatsapp/accounts/ch/pair-code")
-                    .header("Authorization", "Bearer dev_project_key")
+                    .uri("/v1/companies/c/channels/whatsapp/accounts/ch/pair-code")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3181,7 +3827,7 @@ mod tests {
         let contact_id = "5511999999999@s.whatsapp.net";
         let group_id = "120363000000000000@g.us";
         state.receive_inbound_text(
-            "p",
+            crate::models::INTERNAL_PROJECT_ID,
             "c",
             SimulateInboundTextRequest {
                 conversation_id: Some(contact_id.to_string()),
@@ -3193,7 +3839,7 @@ mod tests {
             },
         );
         state.receive_inbound_text(
-            "p",
+            crate::models::INTERNAL_PROJECT_ID,
             "c",
             SimulateInboundTextRequest {
                 conversation_id: Some(group_id.to_string()),
@@ -3205,7 +3851,7 @@ mod tests {
             },
         );
         state.receive_inbound_text(
-            "p",
+            crate::models::INTERNAL_PROJECT_ID,
             "c",
             SimulateInboundTextRequest {
                 conversation_id: Some(group_id.to_string()),
@@ -3217,7 +3863,7 @@ mod tests {
             },
         );
         state.receive_inbound_text(
-            "p",
+            crate::models::INTERNAL_PROJECT_ID,
             "c",
             SimulateInboundTextRequest {
                 conversation_id: Some(group_id.to_string()),
@@ -3230,26 +3876,12 @@ mod tests {
         );
         let app = build_router(state);
 
-        let unauthorized = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri(format!("/v1/projects/p/companies/c/contacts/{contact_id}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
-
         let contact_response = app
             .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri(format!("/v1/projects/p/companies/c/contacts/{contact_id}"))
-                    .header("Authorization", "Bearer dev_project_key")
+                    .uri(format!("/v1/companies/c/contacts/{contact_id}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3260,7 +3892,9 @@ mod tests {
             .await
             .unwrap();
         let contact: Value = serde_json::from_slice(&contact_body).unwrap();
-        assert_eq!(contact["id"], contact_id);
+        assert_eq!(contact["id"], "5511999999999");
+        assert_eq!(contact["technical_id"], contact_id);
+        assert_eq!(contact["phone_number"], "5511999999999");
         assert_eq!(contact["display_name"], "Cliente Rota");
         assert_eq!(contact["phone_e164"], "+5511999999999");
 
@@ -3269,8 +3903,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri(format!("/v1/projects/p/companies/c/groups/{group_id}"))
-                    .header("Authorization", "Bearer dev_project_key")
+                    .uri(format!("/v1/companies/c/groups/{group_id}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3290,10 +3923,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri(format!(
-                        "/v1/projects/p/companies/c/groups/{group_id}/members?limit=2"
-                    ))
-                    .header("Authorization", "Bearer dev_project_key")
+                    .uri(format!("/v1/companies/c/groups/{group_id}/members?limit=2"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3314,9 +3944,8 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri(format!(
-                        "/v1/projects/p/companies/c/groups/{group_id}/members?limit=2&cursor=2"
+                        "/v1/companies/c/groups/{group_id}/members?limit=2&cursor=2"
                     ))
-                    .header("Authorization", "Bearer dev_project_key")
                     .body(Body::empty())
                     .unwrap(),
             )

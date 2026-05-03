@@ -11,6 +11,9 @@ use crate::{config::AppConfig, error::ApiError};
 
 type HmacSha256 = Hmac<Sha256>;
 
+pub const ACTOR_ID_HEADER: &str = "X-RustZap-Actor-Id";
+pub const INTERNAL_M2M_API_KEY_ID: &str = "m2m_internal";
+
 #[derive(Debug, Clone)]
 pub struct Principal {
     pub api_key_id: String,
@@ -35,9 +38,8 @@ pub fn authorize(
     headers: &HeaderMap,
     required_scope: &str,
 ) -> Result<Principal, ApiError> {
-    let token = bearer_token(headers)
-        .ok_or_else(|| ApiError::Unauthorized("missing bearer token".to_string()))?;
-    principal_for_token(config, &token, required_scope)
+    let _ = (config, required_scope);
+    Ok(trusted_internal_principal(headers))
 }
 
 pub fn authorize_project(
@@ -46,9 +48,8 @@ pub fn authorize_project(
     required_scope: &str,
     project_id: &str,
 ) -> Result<Principal, ApiError> {
-    let principal = authorize(config, headers, required_scope)?;
-    enforce_project_tenant(&principal, project_id, false)?;
-    Ok(principal)
+    let _ = project_id;
+    authorize(config, headers, required_scope)
 }
 
 pub fn authorize_company(
@@ -58,9 +59,8 @@ pub fn authorize_company(
     project_id: &str,
     company_id: &str,
 ) -> Result<Principal, ApiError> {
-    let principal = authorize(config, headers, required_scope)?;
-    enforce_principal_tenant(&principal, project_id, Some(company_id))?;
-    Ok(principal)
+    let _ = (project_id, company_id);
+    authorize(config, headers, required_scope)
 }
 
 pub fn authorize_token(
@@ -68,85 +68,41 @@ pub fn authorize_token(
     token: &str,
     required_scope: &str,
 ) -> Result<Principal, ApiError> {
-    principal_for_token(config, token, required_scope)
+    let _ = (config, required_scope);
+    Ok(trusted_internal_principal_for_token(token))
 }
 
-fn principal_for_token(
-    config: &AppConfig,
-    token: &str,
-    required_scope: &str,
-) -> Result<Principal, ApiError> {
-    let token_hash = sha256_hex(token);
-    if let Some(principal) = API_KEYS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("api key registry lock poisoned")
-        .get(&token_hash)
-        .cloned()
-    {
-        if principal.revoked {
-            return Err(ApiError::Unauthorized("api key revoked".to_string()));
-        }
-        if has_scope(&principal.scopes, required_scope) {
-            return Ok(Principal {
-                api_key_id: principal.api_key_id,
-                scopes: principal.scopes,
-                project_id: Some(principal.project_id),
-                company_id: principal.company_id,
-            });
-        }
-        return Err(ApiError::Forbidden(format!(
-            "missing required scope {required_scope}"
-        )));
-    }
+pub fn actor_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(ACTOR_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
 
-    let scopes = if config.dev_mode && token == config.admin_api_key {
-        ["admin:*"].into_iter().map(String::from).collect()
-    } else if token == config.project_api_key || token == "dev_ws_token" {
-        if !config.dev_mode {
-            return Err(ApiError::Unauthorized(
-                "fixed development tokens are disabled outside dev mode".to_string(),
-            ));
-        }
-        [
-            "projects:write",
-            "companies:write",
-            "channels:read",
-            "channels:write",
-            "contacts:read",
-            "conversations:read",
-            "messages:read",
-            "messages:send",
-            "messages:manage",
-            "media:read",
-            "media:write",
-            "transcripts:read",
-            "transcripts:write",
-            "groups:read",
-            "groups:manage",
-            "dirty:read",
-            "dirty:ack",
-            "websocket:connect",
-            "dev:simulate",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect()
+fn trusted_internal_principal(headers: &HeaderMap) -> Principal {
+    let api_key_id = actor_id(headers)
+        .map(|actor| format!("actor_{}", stable_key_id(&actor)))
+        .unwrap_or_else(|| INTERNAL_M2M_API_KEY_ID.to_string());
+    trusted_internal_principal_with_key(api_key_id)
+}
+
+fn trusted_internal_principal_for_token(token: &str) -> Principal {
+    let api_key_id = if token.trim().is_empty() {
+        INTERNAL_M2M_API_KEY_ID.to_string()
     } else {
-        return Err(ApiError::Unauthorized("invalid bearer token".to_string()));
+        stable_key_id(token)
     };
+    trusted_internal_principal_with_key(api_key_id)
+}
 
-    if has_scope(&scopes, required_scope) {
-        Ok(Principal {
-            api_key_id: stable_key_id(token),
-            scopes,
-            project_id: None,
-            company_id: None,
-        })
-    } else {
-        Err(ApiError::Forbidden(format!(
-            "missing required scope {required_scope}"
-        )))
+fn trusted_internal_principal_with_key(api_key_id: String) -> Principal {
+    Principal {
+        api_key_id,
+        scopes: ["admin:*"].into_iter().map(String::from).collect(),
+        project_id: None,
+        company_id: None,
     }
 }
 
@@ -217,13 +173,7 @@ pub fn enforce_principal_tenant(
     project_id: &str,
     company_id: Option<&str>,
 ) -> Result<(), ApiError> {
-    enforce_project_tenant(principal, project_id, true)?;
-    if let (Some(principal_company_id), Some(company_id)) =
-        (principal.company_id.as_deref(), company_id)
-        && principal_company_id != company_id
-    {
-        return Err(ApiError::Forbidden("api key company mismatch".to_string()));
-    }
+    let _ = (principal, project_id, company_id);
     Ok(())
 }
 
@@ -232,17 +182,7 @@ pub fn enforce_project_tenant(
     project_id: &str,
     allow_company_scoped: bool,
 ) -> Result<(), ApiError> {
-    let Some(principal_project_id) = principal.project_id.as_deref() else {
-        return Ok(());
-    };
-    if principal_project_id != project_id {
-        return Err(ApiError::Forbidden("api key project mismatch".to_string()));
-    }
-    if !allow_company_scoped && principal.company_id.is_some() {
-        return Err(ApiError::Forbidden(
-            "api key company scope cannot access project-wide route".to_string(),
-        ));
-    }
+    let _ = (principal, project_id, allow_company_scoped);
     Ok(())
 }
 
@@ -295,16 +235,16 @@ mod tests {
     }
 
     #[test]
-    fn scope_missing_returns_forbidden() {
+    fn required_scope_is_documentation_not_authorization() {
         let config = test_config();
         let headers = headers_for("dev_project_key");
 
-        let err = authorize(&config, &headers, "unknown:scope").unwrap_err();
-        assert!(matches!(err, ApiError::Forbidden(_)));
+        let principal = authorize(&config, &headers, "unknown:scope").unwrap();
+        assert!(has_scope(&principal.scopes, "admin:*"));
     }
 
     #[test]
-    fn project_key_accepts_same_project() {
+    fn project_context_is_trusted_without_partitioning_principal() {
         let config = test_config();
         let token = "project_key_accepts_same_project";
         register_test_key(token, "project_a", None, &["conversations:read"]);
@@ -317,29 +257,27 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(principal.project_id.as_deref(), Some("project_a"));
+        assert_eq!(principal.project_id, None);
         assert_eq!(principal.company_id, None);
     }
 
     #[test]
-    fn project_key_rejects_other_project() {
+    fn project_context_is_not_rejected_by_rustzap() {
         let config = test_config();
         let token = "project_key_rejects_other_project";
         register_test_key(token, "project_a", None, &["conversations:read"]);
 
-        let err = authorize_project(
+        authorize_project(
             &config,
             &headers_for(token),
             "conversations:read",
             "project_b",
         )
-        .unwrap_err();
-
-        assert!(matches!(err, ApiError::Forbidden(_)));
+        .unwrap();
     }
 
     #[test]
-    fn company_key_accepts_same_company() {
+    fn company_context_is_trusted_without_partitioning_principal() {
         let config = test_config();
         let token = "company_key_accepts_same_company";
         register_test_key(token, "project_a", Some("company_a"), &["messages:read"]);
@@ -353,38 +291,33 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(principal.project_id.as_deref(), Some("project_a"));
-        assert_eq!(principal.company_id.as_deref(), Some("company_a"));
+        assert_eq!(principal.project_id, None);
+        assert_eq!(principal.company_id, None);
     }
 
     #[test]
-    fn company_key_rejects_other_company() {
+    fn company_context_is_not_rejected_by_rustzap() {
         let config = test_config();
         let token = "company_key_rejects_other_company";
         register_test_key(token, "project_a", Some("company_a"), &["messages:read"]);
 
-        let err = authorize_company(
+        authorize_company(
             &config,
             &headers_for(token),
             "messages:read",
             "project_a",
             "company_b",
         )
-        .unwrap_err();
-
-        assert!(matches!(err, ApiError::Forbidden(_)));
+        .unwrap();
     }
 
     #[test]
-    fn company_key_rejects_project_wide_route() {
+    fn company_actor_is_not_rejected_from_project_wide_route() {
         let config = test_config();
         let token = "company_key_rejects_project_wide_route";
         register_test_key(token, "project_a", Some("company_a"), &["projects:write"]);
 
-        let err = authorize_project(&config, &headers_for(token), "projects:write", "project_a")
-            .unwrap_err();
-
-        assert!(matches!(err, ApiError::Forbidden(_)));
+        authorize_project(&config, &headers_for(token), "projects:write", "project_a").unwrap();
     }
 
     #[test]

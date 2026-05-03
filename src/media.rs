@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use time::{Date, macros::format_description};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,12 +91,15 @@ pub fn r2_object_key(input: R2ObjectKeyInput<'_>) -> String {
     let ext = input.ext.trim_start_matches('.');
     match input.class {
         "permanent" => format!(
-            "{}/permanent/project={}/company={}/entity={}/entity_id={}/date={}/media={}.{}",
+            "{}/permanent/project={}/company={}/entity={}/entity_id_hash={}/date={}/media={}.{}",
             input.base_prefix,
             input.project_id,
             input.company_id,
             input.entity_type.unwrap_or("unknown"),
-            input.entity_id.unwrap_or("unknown"),
+            input
+                .entity_id
+                .map(opaque_id_hash)
+                .unwrap_or_else(|| "unknown".to_string()),
             date,
             input.media_id,
             ext
@@ -110,19 +114,34 @@ pub fn r2_object_key(input: R2ObjectKeyInput<'_>) -> String {
             input.media_id,
             ext
         ),
-        class => format!(
-            "{}/{}/project={}/company={}/channel={}/conversation={}/date={}/media={}.{}",
-            input.base_prefix,
-            class,
-            input.project_id,
-            input.company_id,
-            input.channel_id,
-            input.conversation_id.unwrap_or("unknown"),
-            date,
-            input.media_id,
-            ext
-        ),
+        class => {
+            let conversation_hash = input
+                .conversation_id
+                .map(conversation_hash)
+                .unwrap_or_else(|| "unknown".to_string());
+            format!(
+                "{}/{}/project={}/company={}/channel={}/conversation_hash={}/date={}/media={}.{}",
+                input.base_prefix,
+                class,
+                input.project_id,
+                input.company_id,
+                input.channel_id,
+                conversation_hash,
+                date,
+                input.media_id,
+                ext
+            )
+        }
     }
+}
+
+fn conversation_hash(conversation_id: &str) -> String {
+    opaque_id_hash(conversation_id)
+}
+
+fn opaque_id_hash(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    hex::encode(&digest[..12])
 }
 
 #[cfg(test)]
@@ -142,14 +161,14 @@ mod tests {
     }
 
     #[test]
-    fn r2_key_uses_ids_not_pii() {
+    fn r2_key_hashes_conversation_ids_so_jids_are_not_persisted() {
         let key = r2_object_key(R2ObjectKeyInput {
             base_prefix: "rustzap",
             class: "temp",
             project_id: "tetoz",
             company_id: "company_123",
             channel_id: "channel_123",
-            conversation_id: Some("conv_123"),
+            conversation_id: Some("5511999999999@s.whatsapp.net"),
             entity_type: None,
             entity_id: None,
             date: date!(2026 - 04 - 26),
@@ -157,12 +176,33 @@ mod tests {
             ext: ".ogg",
         });
 
-        assert_eq!(
-            key,
-            "rustzap/temp/project=tetoz/company=company_123/channel=channel_123/conversation=conv_123/date=2026-04-26/media=media_123.ogg"
-        );
+        assert!(key.contains("conversation_hash="));
+        assert!(!key.contains("conversation=5511999999999@s.whatsapp.net"));
+        assert!(!key.contains("5511999999999"));
+        assert!(!key.contains("s.whatsapp.net"));
         assert!(!key.contains("+55"));
         assert!(!key.contains("maria"));
+    }
+
+    #[test]
+    fn permanent_key_hashes_entity_id_so_phone_numbers_are_not_persisted() {
+        let key = r2_object_key(R2ObjectKeyInput {
+            base_prefix: "rustzap",
+            class: "permanent",
+            project_id: "tetoz",
+            company_id: "company_123",
+            channel_id: "channel_123",
+            conversation_id: None,
+            entity_type: Some("contact"),
+            entity_id: Some("+5511999999999"),
+            date: date!(2026 - 04 - 26),
+            media_id: "media_123",
+            ext: ".jpg",
+        });
+
+        assert!(key.contains("entity_id_hash="));
+        assert!(!key.contains("+5511999999999"));
+        assert!(!key.contains("5511999999999"));
     }
 
     #[test]

@@ -20,8 +20,8 @@ use uuid::Uuid;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
 use crate::{
-    config::{AppConfig, ConsumerSignalMode, EventBusMode, MetadataDbMode},
-    db::{KafkaDeadLetterRecord, MetadataDb},
+    config::{AppConfig, ConsumerSignalMode, EventBusMode, MetadataDbMode, StorageProvider},
+    db::{KafkaDeadLetterRecord, MetadataDb, OutboxRecord},
     error::{ApiError, ApiResult},
     eventbus::{EventBusHandle, dirty_signal, new_event},
     media::{MediaDecision, MediaLimits, R2ObjectKeyInput, magic_matches_mime, r2_object_key},
@@ -32,7 +32,7 @@ use crate::{
     },
     rate_limit::RateLimiter,
     security::sha256_json,
-    storage::upload_r2_bytes,
+    storage::MediaByteStore,
     transcription::{
         GroqSttClient, TranscriptLifecycle, groq_transcript_from_result, mock_transcript,
         transcript_with_lifecycle,
@@ -53,6 +53,7 @@ pub struct AppState {
     event_bus: EventBusHandle,
     rate_limiter: Arc<RateLimiter>,
     metrics: Arc<RuntimeMetrics>,
+    media_bytes: MediaByteStore,
     dev_state_path: Option<PathBuf>,
     metadata_db: Option<Arc<MetadataDb>>,
     metadata_persist_tx: Option<mpsc::UnboundedSender<PersistedStore>>,
@@ -83,7 +84,6 @@ struct InboundMediaRecordInput<'a> {
     sha256: String,
     storage_status: &'a str,
     object_key: Option<String>,
-    bytes: Option<Vec<u8>>,
 }
 
 #[derive(Default)]
@@ -102,6 +102,14 @@ pub struct RuntimeMetricsSnapshot {
     pub webhook_delivery_successes_total: u64,
     pub stt_requests_total: u64,
     pub websocket_subscriptions_total: u64,
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct RetentionSummary {
+    pub messages_removed: usize,
+    pub transcripts_removed: usize,
+    pub transcripts_redacted: usize,
+    pub media_removed: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -253,10 +261,10 @@ struct StoreInner {
     group_members: HashMap<String, HashMap<String, GroupMemberRecord>>,
     group_profile_refreshes: HashMap<String, OffsetDateTime>,
     media: HashMap<String, MediaObject>,
-    media_blobs: HashMap<String, Vec<u8>>,
     transcripts: HashMap<String, Transcript>,
     qr: HashMap<String, QrState>,
     events: Vec<crate::models::CommonEvent>,
+    internal_processed_event_ids: HashSet<String>,
     callbacks: HashMap<String, Value>,
     webhook_delivery_attempts: Vec<WebhookDeliveryAttempt>,
     audit_logs: Vec<Value>,
@@ -281,7 +289,6 @@ pub(crate) struct PersistedStore {
     pub(crate) group_members: HashMap<String, HashMap<String, GroupMemberRecord>>,
     pub(crate) group_profile_refreshes: HashMap<String, OffsetDateTime>,
     pub(crate) media: HashMap<String, MediaObject>,
-    pub(crate) media_blobs: HashMap<String, Vec<u8>>,
     pub(crate) transcripts: HashMap<String, Transcript>,
     pub(crate) qr: HashMap<String, QrState>,
     pub(crate) events: Vec<crate::models::CommonEvent>,
@@ -332,7 +339,6 @@ impl PersistedStore {
                 inner.group_profile_refreshes.clone(),
             ),
             media: inner.media.clone(),
-            media_blobs: inner.media_blobs.clone(),
             transcripts: inner.transcripts.clone(),
             qr: inner.qr.clone(),
             events: inner.events.clone(),
@@ -363,10 +369,10 @@ impl PersistedStore {
                 store.group_profile_refreshes,
             ),
             media: store.media,
-            media_blobs: store.media_blobs,
             transcripts: store.transcripts,
             qr: store.qr,
             events: store.events,
+            internal_processed_event_ids: HashSet::new(),
             callbacks: store.callbacks,
             webhook_delivery_attempts: store.webhook_delivery_attempts,
             audit_logs: store.audit_logs,
@@ -454,10 +460,6 @@ fn sanitize_updates_surfaces(mut store: PersistedStore) -> PersistedStore {
                 .as_deref()
                 .is_none_or(|message_id| !removed_message_ids.contains(message_id))
     });
-    let media_ids: HashSet<_> = store.media.keys().cloned().collect();
-    store
-        .media_blobs
-        .retain(|media_id, _| media_ids.contains(media_id));
     store
         .transcripts
         .retain(|message_id, _| !removed_message_ids.contains(message_id));
@@ -491,7 +493,98 @@ fn sanitize_updates_surfaces(mut store: PersistedStore) -> PersistedStore {
                 .as_deref()
                 .is_none_or(|message_id| !removed_message_ids.contains(message_id))
     });
+    ensure_media_conversation_placeholders(&mut store);
     store
+}
+
+fn ensure_media_conversation_placeholders(store: &mut PersistedStore) {
+    let orphan_media: Vec<MediaObject> = store
+        .media
+        .values()
+        .filter(|media| {
+            !media.conversation_id.trim().is_empty()
+                && !store.conversations.contains_key(&media.conversation_id)
+        })
+        .cloned()
+        .collect();
+
+    for media in orphan_media {
+        if store.conversations.contains_key(&media.conversation_id) {
+            continue;
+        }
+        let conversation_id = media.conversation_id.clone();
+        let is_group = conversation_id.ends_with("@g.us");
+        let channel_id =
+            placeholder_channel_for_project_company(store, &media.project_id, &media.company_id);
+        store.conversations.insert(
+            conversation_id.clone(),
+            crate::models::Conversation {
+                id: conversation_id.clone(),
+                project_id: media.project_id.clone(),
+                company_id: media.company_id.clone(),
+                channel_account_id: channel_id,
+                conversation_type: if is_group { "group" } else { "direct" }.to_string(),
+                contact_id: if is_group {
+                    None
+                } else {
+                    Some(conversation_id.clone())
+                },
+                group_id: None,
+                display_name: Some(if is_group {
+                    group_subject_for_jid(&conversation_id)
+                } else {
+                    display_name_for_jid(&conversation_id)
+                }),
+                display_phone: if is_group {
+                    None
+                } else {
+                    phone_from_jid(&conversation_id)
+                },
+                phone_number: if is_group {
+                    None
+                } else {
+                    phone_number_from_jid(&conversation_id)
+                },
+                avatar_url: None,
+                profile_picture_url: None,
+                last_seq: 0,
+                last_message_at: None,
+                unread_count: 0,
+                is_archived: false,
+                is_muted: false,
+                is_pinned: false,
+                control_mode: "manual".to_string(),
+                created_at: media.created_at,
+                updated_at: media.updated_at,
+            },
+        );
+    }
+}
+
+fn placeholder_channel_for_project_company(
+    store: &PersistedStore,
+    project_id: &str,
+    company_id: &str,
+) -> String {
+    store
+        .channels
+        .iter()
+        .find_map(|(id, channel)| {
+            (channel_belongs_to_company(channel, project_id, company_id)
+                && channel.get("status").and_then(Value::as_str) == Some("connected"))
+            .then(|| id.clone())
+        })
+        .or_else(|| {
+            store.channels.iter().find_map(|(id, channel)| {
+                channel_belongs_to_company(channel, project_id, company_id).then(|| id.clone())
+            })
+        })
+        .unwrap_or_else(|| "channel_dev".to_string())
+}
+
+fn channel_belongs_to_company(channel: &Value, project_id: &str, company_id: &str) -> bool {
+    channel.get("project_id").and_then(Value::as_str) == Some(project_id)
+        && channel.get("company_id").and_then(Value::as_str) == Some(company_id)
 }
 
 fn raw_whatsapp_event_must_stay_inline(event: &WhatsappEvent) -> bool {
@@ -576,8 +669,42 @@ pub(crate) struct DirtyLeaseRecord {
     pub(crate) max_seq: i64,
 }
 
+#[derive(Debug, Clone)]
+struct CompanyPrivacyPolicy {
+    message_retention_days: Option<u64>,
+    media_temp_retention_days: Option<u64>,
+    transcript_retention_days: Option<u64>,
+    allow_transcript_storage: bool,
+}
+
 fn default_now() -> OffsetDateTime {
     OffsetDateTime::now_utc()
+}
+
+fn company_privacy_policy(company: &Value) -> CompanyPrivacyPolicy {
+    let privacy = company.get("privacy").unwrap_or(&Value::Null);
+    CompanyPrivacyPolicy {
+        message_retention_days: privacy
+            .get("message_retention_days")
+            .and_then(Value::as_u64)
+            .or(Some(365)),
+        media_temp_retention_days: privacy
+            .get("media_temp_retention_days")
+            .and_then(Value::as_u64)
+            .or(Some(30)),
+        transcript_retention_days: privacy
+            .get("transcript_retention_days")
+            .and_then(Value::as_u64)
+            .or(Some(365)),
+        allow_transcript_storage: privacy
+            .get("allow_transcript_storage")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+    }
+}
+
+fn retention_cutoff(now: OffsetDateTime, days: Option<u64>) -> Option<OffsetDateTime> {
+    days.map(|days| now - Duration::days(i64::try_from(days).unwrap_or(i64::MAX)))
 }
 
 fn dev_state_path(config: &AppConfig) -> Option<PathBuf> {
@@ -644,12 +771,13 @@ impl AppState {
     pub fn new(config: AppConfig) -> Self {
         let (events_tx, _) = broadcast::channel(1024);
         let event_bus = EventBusHandle::local(config.event_bus, config.kafka.clone());
+        let media_bytes = MediaByteStore::from_config(&config);
         let dev_state_path = dev_state_path(&config);
         let inner = dev_state_path
             .as_deref()
             .and_then(load_dev_state)
             .unwrap_or_default();
-        Self {
+        let state = Self {
             config: Arc::new(config),
             inner: Arc::new(Mutex::new(inner)),
             whatsapp: WhatsappManager::default(),
@@ -657,16 +785,20 @@ impl AppState {
             event_bus,
             rate_limiter: Arc::new(RateLimiter::default()),
             metrics: Arc::new(RuntimeMetrics::default()),
+            media_bytes,
             dev_state_path,
             metadata_db: None,
             metadata_persist_tx: None,
-        }
+        };
+        state.upgrade_legacy_callback_secrets();
+        state
     }
 
     pub async fn from_config(config: AppConfig) -> anyhow::Result<Self> {
         if config.metadata_db != MetadataDbMode::Postgres {
             let event_bus =
                 EventBusHandle::from_config(config.event_bus, config.kafka.clone()).await?;
+            let media_bytes = MediaByteStore::from_config(&config);
             let (events_tx, _) = broadcast::channel(1024);
             let dev_state_path = dev_state_path(&config);
             let inner = dev_state_path
@@ -681,16 +813,21 @@ impl AppState {
                 event_bus,
                 rate_limiter: Arc::new(RateLimiter::default()),
                 metrics: Arc::new(RuntimeMetrics::default()),
+                media_bytes,
                 dev_state_path,
                 metadata_db: None,
                 metadata_persist_tx: None,
             };
+            state.upgrade_legacy_callback_secrets();
             state.spawn_webhook_delivery_worker();
+            state.spawn_internal_event_dispatcher();
+            state.spawn_retention_worker();
             return Ok(state);
         }
 
         let metadata_db = Arc::new(MetadataDb::connect(&config).await?);
         metadata_db.migrate().await?;
+        let media_bytes = MediaByteStore::from_config(&config);
         let event_bus = EventBusHandle::from_config_with_outbox(
             config.event_bus,
             config.kafka.clone(),
@@ -721,13 +858,163 @@ impl AppState {
             event_bus,
             rate_limiter: Arc::new(RateLimiter::default()),
             metrics: Arc::new(RuntimeMetrics::default()),
+            media_bytes,
             dev_state_path: None,
             metadata_db: Some(metadata_db),
             metadata_persist_tx: Some(metadata_persist_tx),
         };
+        state.upgrade_legacy_callback_secrets();
         crate::workers::spawn_kafka_workers(state.clone());
         state.spawn_webhook_delivery_worker();
+        state.spawn_internal_event_dispatcher();
+        state.spawn_retention_worker();
         Ok(state)
+    }
+
+    fn spawn_internal_event_dispatcher(&self) {
+        match self.config.event_bus {
+            EventBusMode::Kafka => {}
+            EventBusMode::InMemory => {
+                let state = self.clone();
+                let mut rx = state.events_tx.subscribe();
+                tokio::spawn(async move {
+                    loop {
+                        match rx.recv().await {
+                            Ok(event) => state.process_internal_work_event(event).await,
+                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::warn!(skipped, "internal event dispatcher lagged")
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
+            }
+            EventBusMode::Postgres => {
+                self.spawn_postgres_event_drainer();
+            }
+        }
+    }
+
+    fn spawn_postgres_event_drainer(&self) {
+        let Some(db) = self.metadata_db.clone() else {
+            return;
+        };
+        let state = self.clone();
+        tokio::spawn(async move {
+            let worker_id = format!("postgres-dispatcher-{}", Uuid::now_v7().simple());
+            loop {
+                let records = match db.claim_event_outbox_batch(&worker_id, 50, 30).await {
+                    Ok(records) => records,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "postgres event drainer claim failed");
+                        tokio::time::sleep(StdDuration::from_millis(500)).await;
+                        continue;
+                    }
+                };
+                if records.is_empty() {
+                    tokio::time::sleep(StdDuration::from_millis(250)).await;
+                    continue;
+                }
+                for record in records {
+                    state.process_postgres_outbox_record(&db, record).await;
+                }
+            }
+        });
+    }
+
+    async fn process_postgres_outbox_record(&self, db: &MetadataDb, record: OutboxRecord) {
+        let event = match serde_json::from_value::<crate::models::CommonEvent>(
+            record.payload_json.clone(),
+        ) {
+            Ok(event) => event,
+            Err(err) => {
+                if let Err(mark_err) = db
+                    .mark_event_outbox_deadlettered(&record.event_id, &err.to_string())
+                    .await
+                {
+                    tracing::error!(event_id = record.event_id, error = %mark_err, "failed to deadletter undecodable postgres event");
+                }
+                return;
+            }
+        };
+        if !internal_work_event_type(&event.event_type) {
+            if let Err(err) = db
+                .mark_event_outbox_published(&record.event_id, -1, -1)
+                .await
+            {
+                tracing::warn!(event_id = record.event_id, error = %err, "failed to mark ignored postgres event published");
+            }
+            return;
+        }
+
+        let result = self.handle_internal_work_event(&event).await;
+        match result {
+            Ok(()) => {
+                if let Err(err) = db
+                    .mark_event_outbox_published(&record.event_id, -1, -1)
+                    .await
+                {
+                    tracing::warn!(event_id = record.event_id, error = %err, "failed to mark postgres event processed");
+                }
+            }
+            Err(err) => {
+                let error = err.to_string();
+                let attempts = record.attempt_count.saturating_add(1);
+                if attempts as u32 >= self.config.kafka.retry_max_attempts {
+                    if let Err(mark_err) = db
+                        .mark_event_outbox_deadlettered(&record.event_id, &error)
+                        .await
+                    {
+                        tracing::error!(event_id = record.event_id, error = %mark_err, "failed to deadletter postgres event");
+                    }
+                } else {
+                    let backoff =
+                        5_i64.saturating_mul(2_i64.saturating_pow(attempts.min(6) as u32));
+                    if let Err(mark_err) = db
+                        .mark_event_outbox_failed(&record.event_id, &error, backoff)
+                        .await
+                    {
+                        tracing::error!(event_id = record.event_id, error = %mark_err, "failed to mark postgres event failed");
+                    }
+                }
+            }
+        }
+    }
+
+    async fn process_internal_work_event(&self, event: crate::models::CommonEvent) {
+        if !internal_work_event_type(&event.event_type) || !self.claim_internal_event(&event) {
+            return;
+        }
+        if let Err(err) = self.handle_internal_work_event(&event).await {
+            tracing::warn!(
+                event_id = event.event_id,
+                event_type = event.event_type,
+                error = %err,
+                "internal event dispatcher failed"
+            );
+        }
+    }
+
+    async fn handle_internal_work_event(
+        &self,
+        event: &crate::models::CommonEvent,
+    ) -> ApiResult<()> {
+        match event.event_type.as_str() {
+            "outbound.send.requested" => {
+                self.process_outbound_send_request(event).await.map(|_| ())
+            }
+            "audio.transcription.requested" => {
+                self.process_transcription_request(event).await.map(|_| ())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn claim_internal_event(&self, event: &crate::models::CommonEvent) -> bool {
+        let mut inner = self.inner.lock().expect("store lock poisoned");
+        inner
+            .internal_processed_event_ids
+            .insert(event.event_id.clone())
     }
 
     fn spawn_webhook_delivery_worker(&self) {
@@ -748,6 +1035,32 @@ impl AppState {
         });
     }
 
+    fn spawn_retention_worker(&self) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(StdDuration::from_secs(60 * 60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let summary = state.apply_retention_once();
+                if summary.messages_removed
+                    + summary.transcripts_removed
+                    + summary.transcripts_redacted
+                    + summary.media_removed
+                    > 0
+                {
+                    tracing::info!(
+                        messages_removed = summary.messages_removed,
+                        transcripts_removed = summary.transcripts_removed,
+                        transcripts_redacted = summary.transcripts_redacted,
+                        media_removed = summary.media_removed,
+                        "retention worker applied policy"
+                    );
+                }
+            }
+        });
+    }
+
     pub async fn metadata_ready(&self) -> anyhow::Result<()> {
         if let Some(metadata_db) = self.metadata_db.as_ref() {
             metadata_db.check_ready().await?;
@@ -757,6 +1070,45 @@ impl AppState {
 
     pub async fn event_bus_ready(&self) -> crate::eventbus::EventBusHealth {
         self.event_bus.health().await
+    }
+
+    pub async fn storage_ready(&self) -> crate::models::ReadyCheck {
+        match self
+            .media_bytes
+            .ready_check(self.config.r2_ready_write_check)
+            .await
+        {
+            Ok(detail) => crate::models::ReadyCheck {
+                name: "media_storage".to_string(),
+                ok: true,
+                detail,
+            },
+            Err(err) => crate::models::ReadyCheck {
+                name: "media_storage".to_string(),
+                ok: false,
+                detail: err,
+            },
+        }
+    }
+
+    pub fn webhook_secret_ready(&self) -> crate::models::ReadyCheck {
+        let required = self.config.webhook.delivery_enabled && self.webhook_signal_enabled();
+        let ok = !required
+            || (self.config.secret_master_key.is_some()
+                && self.config.secret_master_key_error.is_none());
+        crate::models::ReadyCheck {
+            name: "webhook_secret_key".to_string(),
+            ok,
+            detail: if !required {
+                "webhook delivery disabled".to_string()
+            } else if let Some(error) = self.config.secret_master_key_error.as_ref() {
+                error.clone()
+            } else if self.config.secret_master_key.is_some() {
+                "secret master key configured".to_string()
+            } else {
+                "RUSTZAP_SECRET_MASTER_KEY missing".to_string()
+            },
+        }
     }
 
     pub fn event_bus_snapshot(&self) -> crate::eventbus::EventBusRuntimeSnapshot {
@@ -780,6 +1132,10 @@ impl AppState {
                 .websocket_subscriptions_total
                 .load(Ordering::Relaxed),
         }
+    }
+
+    fn media_bucket_name(&self) -> String {
+        self.config.r2.bucket.clone()
     }
 
     #[cfg(feature = "external-integrations")]
@@ -872,7 +1228,7 @@ impl AppState {
     }
 
     pub fn is_whatsapp_channel_active(&self, channel_id: &str) -> bool {
-        self.whatsapp.is_channel_active(channel_id)
+        self.whatsapp.is_channel_connected(channel_id)
     }
 
     fn kafka_worker_mode_enabled(&self) -> bool {
@@ -1033,6 +1389,10 @@ impl AppState {
             })
     }
 
+    fn company_allows_transcript_storage(&self, project_id: &str, company_id: &str) -> bool {
+        company_privacy_policy(&self.company(project_id, company_id)).allow_transcript_storage
+    }
+
     pub fn create_channel(
         &self,
         project_id: &str,
@@ -1090,7 +1450,7 @@ impl AppState {
             .and_then(|channel| channel.get("status"))
             .and_then(|status| status.as_str())
             == Some("connected")
-            && self.whatsapp.is_channel_active(channel_id);
+            && self.whatsapp.is_channel_connected(channel_id);
         if already_connected {
             return Ok(QrState {
                 channel_id: channel_id.to_string(),
@@ -1100,16 +1460,24 @@ impl AppState {
             });
         }
         let now = OffsetDateTime::now_utc();
-        let active_qr = self
+        let cached_qr = self
             .inner
             .lock()
             .expect("store lock poisoned")
             .qr
             .get(channel_id)
-            .cloned()
-            .filter(|qr| qr.qr_code_text.is_some() && qr.expires_at > now + Duration::seconds(2));
+            .cloned();
+        let active_qr = cached_qr
+            .as_ref()
+            .filter(|qr| qr.qr_code_text.is_some() && qr.expires_at > now + Duration::seconds(2))
+            .cloned();
         if let Some(qr) = active_qr {
             return Ok(qr);
+        }
+        if cached_qr.as_ref().is_some_and(|qr| {
+            qr.qr_code_text.is_some() && qr.expires_at <= now + Duration::seconds(2)
+        }) {
+            self.whatsapp.stop_channel(channel_id);
         }
         let qr = self.set_qr(channel_id, "connecting", None, OffsetDateTime::now_utc());
         self.set_channel_status(channel_id, "connecting", None);
@@ -1153,6 +1521,7 @@ impl AppState {
     }
 
     pub fn channel(&self, channel_id: &str) -> Value {
+        self.reconcile_channel_runtime_status(channel_id);
         self.inner
             .lock()
             .expect("store lock poisoned")
@@ -1160,6 +1529,59 @@ impl AppState {
             .get(channel_id)
             .cloned()
             .unwrap_or_else(|| json!({"id": channel_id, "status": "disconnected"}))
+    }
+
+    fn reconcile_channel_runtime_status(&self, channel_id: &str) {
+        if self.whatsapp.is_channel_connected(channel_id) {
+            return;
+        }
+        let disconnected = {
+            let mut inner = self.inner.lock().expect("store lock poisoned");
+            let Some(channel) = inner.channels.get_mut(channel_id) else {
+                return;
+            };
+            if channel.get("status").and_then(Value::as_str) != Some("connected") {
+                return;
+            }
+
+            let now = OffsetDateTime::now_utc();
+            let project_id = channel
+                .get("project_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let company_id = channel
+                .get("company_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            channel["status"] = json!("disconnected");
+            channel["connected_at"] = Value::Null;
+            channel["updated_at"] = json!(ts(now));
+            inner.qr.insert(
+                channel_id.to_string(),
+                QrState {
+                    channel_id: channel_id.to_string(),
+                    status: "disconnected".to_string(),
+                    qr_code_text: None,
+                    expires_at: now,
+                },
+            );
+            self.persist_locked(&inner);
+            Some((project_id, company_id))
+        };
+        if let Some((project_id, company_id)) = disconnected {
+            self.push_event(new_event(
+                "channel.disconnected",
+                &project_id,
+                &company_id,
+                Some(channel_id.to_string()),
+                None,
+                None,
+                None,
+                json!({}),
+            ));
+        }
     }
 
     pub fn set_channel_status(
@@ -1232,7 +1654,9 @@ impl AppState {
     }
 
     pub fn qr(&self, channel_id: &str) -> QrState {
-        let inner = self.inner.lock().expect("store lock poisoned");
+        self.reconcile_channel_runtime_status(channel_id);
+        let now = OffsetDateTime::now_utc();
+        let mut inner = self.inner.lock().expect("store lock poisoned");
         if inner
             .channels
             .get(channel_id)
@@ -1247,16 +1671,36 @@ impl AppState {
                 expires_at: OffsetDateTime::now_utc(),
             };
         }
-        inner
-            .qr
-            .get(channel_id)
-            .cloned()
-            .unwrap_or_else(|| QrState {
-                channel_id: channel_id.to_string(),
-                status: "disconnected".to_string(),
-                qr_code_text: None,
-                expires_at: OffsetDateTime::now_utc(),
-            })
+        if let Some(qr) = inner.qr.get(channel_id).cloned() {
+            if qr.qr_code_text.is_some() && qr.expires_at <= now {
+                let expired = QrState {
+                    channel_id: channel_id.to_string(),
+                    status: "disconnected".to_string(),
+                    qr_code_text: None,
+                    expires_at: now,
+                };
+                inner.qr.insert(channel_id.to_string(), expired.clone());
+                if let Some(channel) = inner.channels.get_mut(channel_id) {
+                    if matches!(
+                        channel.get("status").and_then(Value::as_str),
+                        Some("connecting" | "waiting_qr")
+                    ) {
+                        channel["status"] = json!("disconnected");
+                        channel["connected_at"] = Value::Null;
+                        channel["updated_at"] = json!(ts(now));
+                    }
+                }
+                self.persist_locked(&inner);
+                return expired;
+            }
+            return qr;
+        }
+        QrState {
+            channel_id: channel_id.to_string(),
+            status: "disconnected".to_string(),
+            qr_code_text: None,
+            expires_at: OffsetDateTime::now_utc(),
+        }
     }
 
     pub fn send_message(
@@ -1274,6 +1718,7 @@ impl AppState {
                 conversation_id,
                 idempotency_key,
                 request,
+                None,
             )?
             .message)
     }
@@ -1285,6 +1730,7 @@ impl AppState {
         conversation_id: &str,
         idempotency_key: &str,
         request: SendMessageRequest,
+        sent_by_external_user_id: Option<String>,
     ) -> ApiResult<SendMessageOutcome> {
         let request_hash = sha256_json(&request)?;
         let idem_key = (
@@ -1293,6 +1739,9 @@ impl AppState {
             idempotency_key.to_string(),
         );
         let mut inner = self.inner.lock().expect("store lock poisoned");
+        let conversation_id =
+            resolve_conversation_id_inner(&inner, project_id, company_id, conversation_id);
+        let conversation_id = conversation_id.as_str();
 
         if let Some(record) = inner.idempotency.get(&idem_key) {
             if record.request_hash == request_hash {
@@ -1349,7 +1798,8 @@ impl AppState {
         let channel_id = inner
             .conversations
             .get(conversation_id)
-            .map(|conversation| conversation.channel_account_id.clone());
+            .map(|conversation| conversation.channel_account_id.clone())
+            .or_else(|| connected_channel_for_project_company(&inner, project_id, company_id));
         let mut message = record_message_inner(
             &mut inner,
             project_id,
@@ -1364,6 +1814,7 @@ impl AppState {
             None,
             None,
             None,
+            sent_by_external_user_id,
             Some(&self.events_tx),
             Some(&self.event_bus),
         );
@@ -1442,6 +1893,7 @@ impl AppState {
             Some(sender_contact_id),
             request.sender_name,
             request.profile_picture_url,
+            None,
             Some(&self.events_tx),
             Some(&self.event_bus),
         );
@@ -1455,6 +1907,16 @@ impl AppState {
         company_id: &str,
         request: SimulateInboundMediaRequest,
     ) -> (Message, MediaObject, Option<Transcript>) {
+        self.try_receive_inbound_media(project_id, company_id, request)
+            .expect("dev inbound media should be stored")
+    }
+
+    pub fn try_receive_inbound_media(
+        &self,
+        project_id: &str,
+        company_id: &str,
+        request: SimulateInboundMediaRequest,
+    ) -> ApiResult<(Message, MediaObject, Option<Transcript>)> {
         let conversation_id = request
             .conversation_id
             .clone()
@@ -1474,24 +1936,29 @@ impl AppState {
             .map(phone_to_jid)
             .unwrap_or_else(|| conversation_id.clone());
 
-        let mut inner = self.inner.lock().expect("store lock poisoned");
-        let message = record_message_inner(
-            &mut inner,
-            project_id,
-            company_id,
-            &conversation_id,
-            "inbound",
-            &media_type,
-            request.caption,
-            "received",
-            None,
-            Some(channel_id.clone()),
-            Some(sender_contact_id),
-            request.sender_name,
-            request.profile_picture_url,
-            Some(&self.events_tx),
-            Some(&self.event_bus),
-        );
+        let message = {
+            let mut inner = self.inner.lock().expect("store lock poisoned");
+            let message = record_message_inner(
+                &mut inner,
+                project_id,
+                company_id,
+                &conversation_id,
+                "inbound",
+                &media_type,
+                request.caption,
+                "received",
+                None,
+                Some(channel_id.clone()),
+                Some(sender_contact_id),
+                request.sender_name,
+                request.profile_picture_url,
+                None,
+                Some(&self.events_tx),
+                Some(&self.event_bus),
+            );
+            self.persist_locked(&inner);
+            message
+        };
 
         let limits = MediaLimits {
             quick_delete_threshold_mb: self.config.media_quick_delete_threshold_mb,
@@ -1553,7 +2020,7 @@ impl AppState {
             size_bytes,
             sha256,
             storage_status: status.to_string(),
-            bucket: Some(self.config.r2.bucket.clone()),
+            bucket: Some(self.media_bucket_name()),
             object_key,
             permanent_object_key: None,
             public_url: public_url.clone(),
@@ -1566,15 +2033,44 @@ impl AppState {
             created_at: now,
             updated_at: now,
         };
+        if media.storage_status != "rejected"
+            && let Some(object_key) = media.object_key.as_deref()
+            && let Err(err) = self.media_bytes.put_blocking(
+                object_key,
+                &media.mime_type,
+                dev_media_bytes(&media, &message),
+            )
+        {
+            let _ = self.media_bytes.delete_blocking(object_key);
+            let mut inner = self.inner.lock().expect("store lock poisoned");
+            push_event_inner(
+                &mut inner,
+                Some(&self.events_tx),
+                Some(&self.event_bus),
+                new_event(
+                    "media.storage_failed",
+                    project_id,
+                    company_id,
+                    Some(channel_id.clone()),
+                    Some(conversation_id.clone()),
+                    Some(message.id.clone()),
+                    Some(message.conversation_seq),
+                    json!({
+                        "message_id": message.id.clone(),
+                        "media_id": media.id.clone(),
+                        "code": "byte_store_put_failed",
+                        "error": err
+                    }),
+                ),
+            );
+            self.persist_locked(&inner);
+            return Err(ApiError::ProviderError(err));
+        }
+
+        let mut inner = self.inner.lock().expect("store lock poisoned");
         inner.media.insert(media_id.clone(), media.clone());
         let message = attach_media_to_message_inner(&mut inner, &message.id, &media)
             .unwrap_or_else(|| message.clone());
-        if media.media_type == "image" && media.storage_status != "rejected" {
-            inner.media_blobs.insert(
-                media_id.clone(),
-                dev_preview_svg(&media, &message).into_bytes(),
-            );
-        }
 
         let transcript = if media.media_type == "audio" && media.storage_status != "rejected" {
             let transcript = transcript_with_lifecycle(
@@ -1614,25 +2110,7 @@ impl AppState {
 
         self.persist_locked(&inner);
         drop(inner);
-        if media.storage_status != "rejected"
-            && media.media_type == "image"
-            && self.config.r2.can_upload()
-        {
-            let config = self.config.r2.clone();
-            let media_id = media.id.clone();
-            let object_key = media.object_key.clone();
-            let bytes = dev_preview_svg(&media, &message).into_bytes();
-            tokio::spawn(async move {
-                if let Some(object_key) = object_key
-                    && let Err(err) =
-                        upload_r2_bytes(&config, &object_key, "image/svg+xml", bytes).await
-                {
-                    tracing::warn!(media_id, error = %err, "R2 dev upload failed");
-                }
-            });
-        }
-
-        (message, media, transcript)
+        Ok((message, media, transcript))
     }
 
     pub async fn dispatch_prepared_message(
@@ -1654,7 +2132,7 @@ impl AppState {
                 Some(format!("WhatsApp channel {channel_id} is not connected")),
             );
         }
-        if !self.whatsapp.is_channel_active(&channel_id) {
+        if !self.whatsapp.is_channel_connected(&channel_id) {
             self.set_channel_status(&channel_id, "disconnected", None);
             self.set_qr(&channel_id, "disconnected", None, OffsetDateTime::now_utc());
             return self.update_outbound_after_dispatch(
@@ -1665,7 +2143,7 @@ impl AppState {
             );
         }
         let send_result = if let Some(media_id) = outcome.message.media_id.as_deref() {
-            let (media, bytes) = match self.media_blob(media_id) {
+            let (media, bytes) = match self.media_blob(media_id).await {
                 Ok(Some(blob)) => blob,
                 Ok(None) => {
                     return self.update_outbound_after_dispatch(
@@ -2091,23 +2569,11 @@ impl AppState {
                     return;
                 }
                 for wa_message_id in wa_message_ids {
-                    if let Ok(message) = self.update_receipt_by_wa_id(&wa_message_id, &receipt_type)
-                    {
-                        self.push_event(new_event(
-                            "message.receipt",
-                            &message.project_id,
-                            &message.company_id,
-                            Some(message.channel_account_id.clone()),
-                            Some(chat_jid.clone()),
-                            Some(message.id.clone()),
-                            Some(message.conversation_seq),
-                            json!({
-                                "wa_message_id": wa_message_id,
-                                "receipt_type": receipt_type,
-                                "created_at_wa": ts(created_at_wa)
-                            }),
-                        ));
-                    }
+                    let _ = self.update_receipt_by_wa_id_with_context(
+                        &wa_message_id,
+                        &receipt_type,
+                        Some(created_at_wa),
+                    );
                 }
             }
             WhatsappEvent::GroupUpdate {
@@ -2189,6 +2655,9 @@ impl AppState {
             .filter(|message| before_seq.is_none_or(|seq| message.conversation_seq < seq))
             .collect();
         messages.sort_by_key(|message| message.conversation_seq);
+        for message in &mut messages {
+            self.normalize_message_media_urls(message);
+        }
         let has_more = messages.len() > limit;
         messages.truncate(limit);
         let from_seq = messages.first().map(|message| message.conversation_seq);
@@ -2202,6 +2671,20 @@ impl AppState {
         }
     }
 
+    fn normalize_message_media_urls(&self, message: &mut Message) {
+        if self.config.storage_provider != StorageProvider::LocalFs {
+            return;
+        }
+        let Some(media_id) = message.media_id.as_deref() else {
+            return;
+        };
+        let url = self.config.dev_media_url(media_id);
+        message.media_url = Some(url.clone());
+        if message.message_type == "image" {
+            message.thumbnail_url = Some(url);
+        }
+    }
+
     pub fn list_messages_for_conversation(
         &self,
         project_id: &str,
@@ -2211,8 +2694,14 @@ impl AppState {
         before_seq: Option<i64>,
         limit: usize,
     ) -> ApiResult<MessagesPage> {
-        self.conversation(project_id, company_id, conversation_id)?;
-        Ok(self.list_messages(conversation_id, after_seq, before_seq, limit))
+        let conversation = self.conversation(project_id, company_id, conversation_id)?;
+        let public_id = public_conversation_id(&conversation);
+        let mut page = self.list_messages(&conversation.id, after_seq, before_seq, limit);
+        page.conversation_id = public_id.clone();
+        for message in &mut page.messages {
+            message.conversation_id = public_id.clone();
+        }
+        Ok(page)
     }
 
     fn record_whatsapp_message(&self, input: WhatsappMessageInput) -> Message {
@@ -2352,6 +2841,7 @@ impl AppState {
                 group_id: is_group.then(|| input.conversation_id.clone()),
                 display_name: display_name.clone(),
                 display_phone: display_phone.clone(),
+                phone_number: display_phone.as_deref().and_then(phone_number_from_e164),
                 avatar_url: avatar_url.clone(),
                 profile_picture_url: profile_picture_url.clone(),
                 last_seq: 0,
@@ -2375,6 +2865,8 @@ impl AppState {
                 conversation.display_name = display_name;
             }
             if display_phone.is_some() {
+                conversation.phone_number =
+                    display_phone.as_deref().and_then(phone_number_from_e164);
                 conversation.display_phone = display_phone;
             }
             if avatar_url.is_some() {
@@ -2465,7 +2957,11 @@ impl AppState {
                 Some(input.conversation_id),
                 Some(message.id.clone()),
                 Some(conversation_seq),
-                json!({ "wa_message_id": message.wa_message_id }),
+                json!({
+                    "wa_message_id": message.wa_message_id,
+                    "status": message.status.clone(),
+                    "delivery_state": message.delivery_state()
+                }),
             ),
         );
         self.persist_locked(&inner);
@@ -2482,6 +2978,7 @@ impl AppState {
     }
 
     fn channel_status(&self, channel_id: &str) -> Option<String> {
+        self.reconcile_channel_runtime_status(channel_id);
         self.inner
             .lock()
             .expect("store lock poisoned")
@@ -2499,11 +2996,15 @@ impl AppState {
         contact_id: &str,
     ) -> ApiResult<ContactRefreshContext> {
         let inner = self.inner.lock().expect("store lock poisoned");
+        let resolved_contact_id =
+            resolve_contact_id_inner(&inner, project_id, company_id, contact_id);
         let contact = inner
             .contacts
-            .get(contact_id)
+            .get(&resolved_contact_id)
             .filter(|contact| contact.project_id == project_id && contact.company_id == company_id)
-            .ok_or_else(|| ApiError::NotFound(format!("contact {contact_id} not found")))?;
+            .ok_or_else(|| {
+                ApiError::NotFound(format!("contact {resolved_contact_id} not found"))
+            })?;
         let aliases = contact_aliases_for_record(contact);
         let conversation = inner.conversations.values().find(|conversation| {
             conversation.project_id == project_id
@@ -2527,7 +3028,7 @@ impl AppState {
                 .canonical_jid
                 .clone()
                 .or_else(|| contact.lid.clone())
-                .filter(|jid| jid != contact_id),
+                .filter(|jid| jid != &resolved_contact_id),
             push_name: contact.push_name.clone(),
         })
     }
@@ -2879,6 +3380,7 @@ impl AppState {
                 &mut inner,
                 group_id,
                 &participant.contact_id,
+                participant.phone_jid.as_deref(),
                 &display_name,
                 owner_jid.as_deref(),
                 participant.is_admin,
@@ -2992,6 +3494,7 @@ impl AppState {
                     "message_id": updated.id.clone(),
                     "wa_message_id": updated.wa_message_id.clone(),
                     "status": updated.status.clone(),
+                    "delivery_state": updated.delivery_state(),
                     "error_message": updated.error_message.clone()
                 }),
             ),
@@ -3019,6 +3522,7 @@ impl AppState {
                     let group_id = conversation.id.clone();
                     apply_group_record_to_conversation(&mut conversation, &group_id, group);
                 }
+                apply_public_conversation_fields(&inner, &mut conversation);
                 conversation
             })
             .collect();
@@ -3040,7 +3544,19 @@ impl AppState {
             let group_id = conversation.id.clone();
             apply_group_record_to_conversation(&mut conversation, &group_id, group);
         }
+        apply_public_conversation_fields(&inner, &mut conversation);
         Ok(conversation)
+    }
+
+    pub fn public_conversation_id_for_ref(
+        &self,
+        project_id: &str,
+        company_id: &str,
+        conversation_id: &str,
+    ) -> String {
+        self.conversation(project_id, company_id, conversation_id)
+            .map(|conversation| public_conversation_id(&conversation))
+            .unwrap_or_else(|_| conversation_id.to_string())
     }
 
     pub fn contacts(&self, project_id: &str, company_id: &str) -> Vec<Value> {
@@ -3067,11 +3583,11 @@ impl AppState {
         company_id: &str,
         contact_id: &str,
     ) -> ApiResult<Value> {
-        self.inner
-            .lock()
-            .expect("store lock poisoned")
+        let inner = self.inner.lock().expect("store lock poisoned");
+        let contact_id = resolve_contact_id_inner(&inner, project_id, company_id, contact_id);
+        inner
             .contacts
-            .get(contact_id)
+            .get(&contact_id)
             .filter(|contact| contact.project_id == project_id && contact.company_id == company_id)
             .map(contact_json)
             .ok_or_else(|| ApiError::NotFound(format!("contact {contact_id} not found")))
@@ -3119,16 +3635,17 @@ impl AppState {
         company_id: &str,
         phone_e164: &str,
     ) -> ApiResult<Value> {
-        self.inner
-            .lock()
-            .expect("store lock poisoned")
+        let phone_number = phone_number_from_value(phone_e164)
+            .ok_or_else(|| ApiError::BadRequest("phone number is empty".to_string()))?;
+        let inner = self.inner.lock().expect("store lock poisoned");
+        let contact_id =
+            contact_id_for_phone_number_inner(&inner, project_id, company_id, &phone_number)
+                .ok_or_else(|| {
+                    ApiError::NotFound(format!("contact phone {phone_e164} not found"))
+                })?;
+        inner
             .contacts
-            .values()
-            .find(|contact| {
-                contact.project_id == project_id
-                    && contact.company_id == company_id
-                    && contact.phone_e164.as_deref() == Some(phone_e164)
-            })
+            .get(&contact_id)
             .map(contact_json)
             .ok_or_else(|| ApiError::NotFound(format!("contact phone {phone_e164} not found")))
     }
@@ -3171,6 +3688,7 @@ impl AppState {
                     let group_id = conversation.id.clone();
                     apply_group_record_to_conversation(&mut conversation, &group_id, group);
                 }
+                apply_public_conversation_fields(&inner, &mut conversation);
                 conversation
             })
             .collect();
@@ -3334,11 +3852,13 @@ impl AppState {
         conversation_id: &str,
     ) -> ApiResult<crate::models::Conversation> {
         let mut inner = self.inner.lock().expect("store lock poisoned");
+        let conversation_id =
+            resolve_conversation_id_inner(&inner, project_id, company_id, conversation_id);
         let conversation = inner
             .conversations
-            .get_mut(conversation_id)
+            .get_mut(&conversation_id)
             .filter(|conversation| {
-                conversation.project_id == project_id && conversation.company_id == company_id
+                conversation_matches_tenant(conversation, project_id, company_id)
             })
             .ok_or_else(|| ApiError::NotFound("conversation not found".to_string()))?;
         conversation.unread_count = 0;
@@ -3363,7 +3883,113 @@ impl AppState {
         Ok(updated)
     }
 
+    pub fn patch_conversation_metadata(
+        &self,
+        project_id: &str,
+        company_id: &str,
+        conversation_id: &str,
+        body: &Value,
+    ) -> ApiResult<crate::models::Conversation> {
+        let fields = body.as_object().ok_or_else(|| {
+            ApiError::BadRequest("conversation patch body must be an object".to_string())
+        })?;
+        let allowed_fields = ["is_archived", "is_muted", "is_pinned", "control_mode"];
+        for key in fields.keys() {
+            if !allowed_fields.contains(&key.as_str()) {
+                return Err(ApiError::BadRequest(format!(
+                    "unsupported conversation patch field {key}"
+                )));
+            }
+        }
+        if fields.is_empty() {
+            return Err(ApiError::BadRequest(
+                "conversation patch body must include at least one supported field".to_string(),
+            ));
+        }
+
+        let mut inner = self.inner.lock().expect("store lock poisoned");
+        let conversation_id =
+            resolve_conversation_id_inner(&inner, project_id, company_id, conversation_id);
+        let conversation = inner
+            .conversations
+            .get_mut(&conversation_id)
+            .filter(|conversation| {
+                conversation_matches_tenant(conversation, project_id, company_id)
+            })
+            .ok_or_else(|| ApiError::NotFound("conversation not found".to_string()))?;
+        if let Some(value) = fields.get("is_archived") {
+            conversation.is_archived = value
+                .as_bool()
+                .ok_or_else(|| ApiError::BadRequest("is_archived must be a boolean".to_string()))?;
+        }
+        if let Some(value) = fields.get("is_muted") {
+            conversation.is_muted = value
+                .as_bool()
+                .ok_or_else(|| ApiError::BadRequest("is_muted must be a boolean".to_string()))?;
+        }
+        if let Some(value) = fields.get("is_pinned") {
+            conversation.is_pinned = value
+                .as_bool()
+                .ok_or_else(|| ApiError::BadRequest("is_pinned must be a boolean".to_string()))?;
+        }
+        if let Some(value) = fields.get("control_mode") {
+            let control_mode = value
+                .as_str()
+                .ok_or_else(|| ApiError::BadRequest("control_mode must be a string".to_string()))?;
+            if control_mode.trim().is_empty() {
+                return Err(ApiError::BadRequest(
+                    "control_mode must not be empty".to_string(),
+                ));
+            }
+            conversation.control_mode = control_mode.to_string();
+        }
+        conversation.updated_at = OffsetDateTime::now_utc();
+        let updated = conversation.clone();
+        push_event_inner(
+            &mut inner,
+            Some(&self.events_tx),
+            Some(&self.event_bus),
+            new_event(
+                "conversation.updated",
+                project_id,
+                company_id,
+                Some(updated.channel_account_id.clone()),
+                Some(updated.id.clone()),
+                None,
+                Some(updated.last_seq),
+                json!({
+                    "conversation_id": updated.id.clone(),
+                    "is_archived": updated.is_archived,
+                    "is_muted": updated.is_muted,
+                    "is_pinned": updated.is_pinned,
+                    "control_mode": updated.control_mode.clone()
+                }),
+            ),
+        );
+        mark_dirty_inner(
+            &mut inner,
+            project_id,
+            company_id,
+            &updated.id,
+            updated.last_seq,
+            &updated.channel_account_id,
+            Some(&self.events_tx),
+            Some(&self.event_bus),
+        );
+        self.persist_locked(&inner);
+        Ok(updated)
+    }
+
     pub fn update_receipt(&self, message_id: &str, receipt_type: &str) -> ApiResult<Message> {
+        self.update_receipt_with_context(message_id, receipt_type, None)
+    }
+
+    fn update_receipt_with_context(
+        &self,
+        message_id: &str,
+        receipt_type: &str,
+        created_at_wa: Option<OffsetDateTime>,
+    ) -> ApiResult<Message> {
         let mut inner = self.inner.lock().expect("store lock poisoned");
         let message = inner
             .messages_by_id
@@ -3379,6 +4005,38 @@ impl AppState {
         {
             *existing = updated.clone();
         }
+        mark_dirty_inner(
+            &mut inner,
+            &updated.project_id,
+            &updated.company_id,
+            &updated.conversation_id,
+            updated.conversation_seq,
+            &updated.channel_account_id,
+            Some(&self.events_tx),
+            Some(&self.event_bus),
+        );
+        push_event_inner(
+            &mut inner,
+            Some(&self.events_tx),
+            Some(&self.event_bus),
+            new_event(
+                "message.receipt",
+                &updated.project_id,
+                &updated.company_id,
+                Some(updated.channel_account_id.clone()),
+                Some(updated.conversation_id.clone()),
+                Some(updated.id.clone()),
+                Some(updated.conversation_seq),
+                json!({
+                    "message_id": updated.id.clone(),
+                    "wa_message_id": updated.wa_message_id.clone(),
+                    "receipt_type": receipt_type,
+                    "status": updated.status.clone(),
+                    "delivery_state": updated.delivery_state(),
+                    "created_at_wa": created_at_wa.map(ts)
+                }),
+            ),
+        );
         self.persist_locked(&inner);
         Ok(updated)
     }
@@ -3387,6 +4045,15 @@ impl AppState {
         &self,
         wa_message_id: &str,
         receipt_type: &str,
+    ) -> ApiResult<Message> {
+        self.update_receipt_by_wa_id_with_context(wa_message_id, receipt_type, None)
+    }
+
+    fn update_receipt_by_wa_id_with_context(
+        &self,
+        wa_message_id: &str,
+        receipt_type: &str,
+        created_at_wa: Option<OffsetDateTime>,
     ) -> ApiResult<Message> {
         let internal_id = self
             .inner
@@ -3397,7 +4064,7 @@ impl AppState {
             .find(|message| message.wa_message_id.as_deref() == Some(wa_message_id))
             .map(|message| message.id.clone())
             .ok_or_else(|| ApiError::NotFound(format!("wa message {wa_message_id} not found")))?;
-        self.update_receipt(&internal_id, receipt_type)
+        self.update_receipt_with_context(&internal_id, receipt_type, created_at_wa)
     }
 
     pub fn set_message_flag(
@@ -3577,7 +4244,6 @@ impl AppState {
                 sha256: descriptor_sha256_hex(&descriptor),
                 storage_status: "rejected",
                 object_key: None,
-                bytes: None,
             });
         }
 
@@ -3627,7 +4293,6 @@ impl AppState {
                 sha256: hex::encode(Sha256::digest(&bytes)),
                 storage_status: "rejected",
                 object_key: None,
-                bytes: None,
             });
         }
 
@@ -3666,6 +4331,23 @@ impl AppState {
             media_id: &media_id,
             ext,
         }));
+        if let Some(object_key) = object_key.as_deref()
+            && let Err(err) =
+                self.media_bytes
+                    .put_blocking(object_key, &descriptor.mime_type, bytes.clone())
+        {
+            let _ = std::fs::remove_file(&staging_path);
+            let _ = self.media_bytes.delete_blocking(object_key);
+            self.record_media_storage_failed_event(
+                runtime,
+                message,
+                conversation_id,
+                &media_id,
+                "byte_store_put_failed",
+                &err,
+            );
+            return Err(ApiError::ProviderError(err));
+        }
         let media = self.record_inbound_media_object(InboundMediaRecordInput {
             runtime,
             message,
@@ -3676,23 +4358,42 @@ impl AppState {
             sha256: hex::encode(Sha256::digest(&bytes)),
             storage_status,
             object_key: object_key.clone(),
-            bytes: Some(bytes.clone()),
         });
         let _ = std::fs::remove_file(&staging_path);
-        let media = media?;
-        if self.config.r2.can_upload()
-            && let Some(object_key) = object_key
-        {
-            let config = self.config.r2.clone();
-            let mime_type = descriptor.mime_type.clone();
-            let media_id = media.id.clone();
-            tokio::spawn(async move {
-                if let Err(err) = upload_r2_bytes(&config, &object_key, &mime_type, bytes).await {
-                    tracing::warn!(media_id, error = %err, "R2 inbound media upload failed");
-                }
-            });
-        }
-        Ok(media)
+        media
+    }
+
+    fn record_media_storage_failed_event(
+        &self,
+        runtime: &ChannelRuntime,
+        message: &Message,
+        conversation_id: &str,
+        media_id: &str,
+        code: &str,
+        error: &str,
+    ) {
+        let mut inner = self.inner.lock().expect("store lock poisoned");
+        push_event_inner(
+            &mut inner,
+            Some(&self.events_tx),
+            Some(&self.event_bus),
+            new_event(
+                "media.storage_failed",
+                &runtime.project_id,
+                &runtime.company_id,
+                Some(runtime.channel_id.clone()),
+                Some(conversation_id.to_string()),
+                Some(message.id.clone()),
+                Some(message.conversation_seq),
+                json!({
+                    "message_id": message.id.clone(),
+                    "media_id": media_id,
+                    "code": code,
+                    "error": error
+                }),
+            ),
+        );
+        self.persist_locked(&inner);
     }
 
     fn record_inbound_media_object(
@@ -3725,10 +4426,7 @@ impl AppState {
             size_bytes: input.size_bytes,
             sha256: input.sha256,
             storage_status: input.storage_status.to_string(),
-            bucket: input
-                .object_key
-                .as_ref()
-                .map(|_| self.config.r2.bucket.clone()),
+            bucket: input.object_key.as_ref().map(|_| self.media_bucket_name()),
             object_key: input.object_key.clone(),
             permanent_object_key: None,
             public_url,
@@ -3746,31 +4444,30 @@ impl AppState {
         inner.media.insert(media.id.clone(), media.clone());
         let message = attach_media_to_message_inner(&mut inner, &input.message.id, &media)
             .unwrap_or_else(|| input.message.clone());
-        if let Some(bytes) = input.bytes {
-            inner.media_blobs.insert(media.id.clone(), bytes);
+        if media.storage_status != "rejected" {
+            push_event_inner(
+                &mut inner,
+                Some(&self.events_tx),
+                Some(&self.event_bus),
+                new_event(
+                    "media.stored",
+                    &input.runtime.project_id,
+                    &input.runtime.company_id,
+                    Some(input.runtime.channel_id.clone()),
+                    Some(input.conversation_id.to_string()),
+                    Some(message.id.clone()),
+                    Some(message.conversation_seq),
+                    json!({
+                        "message_id": message.id.clone(),
+                        "media_id": media.id.clone(),
+                        "media_type": media.media_type.clone(),
+                        "mime_type": media.mime_type.clone(),
+                        "storage_status": media.storage_status.clone(),
+                        "size_bytes": media.size_bytes
+                    }),
+                ),
+            );
         }
-        push_event_inner(
-            &mut inner,
-            Some(&self.events_tx),
-            Some(&self.event_bus),
-            new_event(
-                "media.stored",
-                &input.runtime.project_id,
-                &input.runtime.company_id,
-                Some(input.runtime.channel_id.clone()),
-                Some(input.conversation_id.to_string()),
-                Some(message.id.clone()),
-                Some(message.conversation_seq),
-                json!({
-                    "message_id": message.id.clone(),
-                    "media_id": media.id.clone(),
-                    "media_type": media.media_type.clone(),
-                    "mime_type": media.mime_type.clone(),
-                    "storage_status": media.storage_status.clone(),
-                    "size_bytes": media.size_bytes
-                }),
-            ),
-        );
         if media.media_type == "audio" && media.storage_status != "rejected" {
             let transcript = transcript_with_lifecycle(
                 &input.runtime.project_id,
@@ -3807,18 +4504,45 @@ impl AppState {
         Ok(media)
     }
 
-    pub fn media_blob(&self, media_id: &str) -> ApiResult<Option<(MediaObject, Vec<u8>)>> {
-        let inner = self.inner.lock().expect("store lock poisoned");
-        let media = inner
-            .media
-            .get(media_id)
-            .cloned()
-            .ok_or_else(|| ApiError::NotFound(format!("media {media_id} not found")))?;
-        Ok(inner
-            .media_blobs
-            .get(media_id)
-            .cloned()
-            .map(|bytes| (media, bytes)))
+    pub async fn media_blob(&self, media_id: &str) -> ApiResult<Option<(MediaObject, Vec<u8>)>> {
+        let media = self.media(media_id)?;
+        let object_key = media
+            .object_key
+            .as_deref()
+            .or(media.permanent_object_key.as_deref());
+        let Some(object_key) = object_key else {
+            return Ok(None);
+        };
+        match self.media_bytes.get(object_key).await {
+            Ok(bytes) => Ok(Some((media, bytes))),
+            Err(err)
+                if err.contains("No such file")
+                    || err.contains("not found")
+                    || err.contains("os error 2") =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(ApiError::ProviderError(err)),
+        }
+    }
+
+    pub async fn copy_media_bytes(
+        &self,
+        source_object_key: &str,
+        destination_object_key: &str,
+        content_type: &str,
+    ) -> ApiResult<()> {
+        self.media_bytes
+            .copy(source_object_key, destination_object_key, content_type)
+            .await
+            .map_err(ApiError::ProviderError)
+    }
+
+    pub async fn delete_media_bytes(&self, object_key: &str) -> ApiResult<()> {
+        self.media_bytes
+            .delete(object_key)
+            .await
+            .map_err(ApiError::ProviderError)
     }
 
     pub async fn upload_outbound_media(
@@ -3836,6 +4560,11 @@ impl AppState {
                 "conversation_id is required".to_string(),
             ));
         }
+        let conversation_id = {
+            let inner = self.inner.lock().expect("store lock poisoned");
+            resolve_conversation_id_inner(&inner, project_id, company_id, conversation_id)
+        };
+        let conversation_id = conversation_id.as_str();
         let size_bytes = u64::try_from(upload.bytes.len()).unwrap_or(u64::MAX);
         let limits = MediaLimits {
             quick_delete_threshold_mb: self.config.media_quick_delete_threshold_mb,
@@ -3872,9 +4601,15 @@ impl AppState {
                 "upload magic bytes do not match declared MIME type {mime_type}"
             )));
         }
-        let channel_id = self
-            .channel_for_conversation(conversation_id)
-            .unwrap_or_else(|| "channel_dev".to_string());
+        let channel_id = {
+            let inner = self.inner.lock().expect("store lock poisoned");
+            inner
+                .conversations
+                .get(conversation_id)
+                .map(|conversation| conversation.channel_account_id.clone())
+                .or_else(|| connected_channel_for_project_company(&inner, project_id, company_id))
+                .unwrap_or_else(|| "channel_dev".to_string())
+        };
         let storage_class = match decision {
             MediaDecision::Temp => "outbound-temp",
             MediaDecision::Quarantine => "quarantine",
@@ -3918,7 +4653,7 @@ impl AppState {
             size_bytes,
             sha256: hex::encode(Sha256::digest(&upload.bytes)),
             storage_status: storage_class.to_string(),
-            bucket: Some(self.config.r2.bucket.clone()),
+            bucket: Some(self.media_bucket_name()),
             object_key: Some(object_key.clone()),
             permanent_object_key: None,
             public_url,
@@ -3931,24 +4666,26 @@ impl AppState {
             created_at: now,
             updated_at: now,
         };
+        if let Err(err) = self
+            .media_bytes
+            .put(&object_key, &mime_type, upload.bytes)
+            .await
         {
-            let mut inner = self.inner.lock().expect("store lock poisoned");
-            inner.media.insert(media_id.clone(), media.clone());
-            inner
-                .media_blobs
-                .insert(media_id.clone(), upload.bytes.clone());
-            self.persist_locked(&inner);
+            let _ = std::fs::remove_file(&staging_path);
+            let _ = self.media_bytes.delete(&object_key).await;
+            return Err(ApiError::ProviderError(err));
         }
-        if self.config.r2.can_upload() {
-            let config = self.config.r2.clone();
-            let media_id_for_log = media_id.clone();
-            let bytes = upload.bytes;
-            tokio::spawn(async move {
-                if let Err(err) = upload_r2_bytes(&config, &object_key, &mime_type, bytes).await {
-                    tracing::warn!(media_id = media_id_for_log, error = %err, "R2 outbound upload failed");
-                }
-            });
-        }
+        let mut inner = self.inner.lock().expect("store lock poisoned");
+        ensure_conversation_inner(
+            &mut inner,
+            project_id,
+            company_id,
+            conversation_id,
+            &channel_id,
+            "manual",
+        );
+        inner.media.insert(media_id.clone(), media.clone());
+        self.persist_locked(&inner);
         let _ = std::fs::remove_file(staging_path);
         Ok(media)
     }
@@ -4030,8 +4767,13 @@ impl AppState {
         company_id: &str,
         conversation_id: &str,
     ) -> ApiResult<Vec<MediaObject>> {
-        self.conversation(project_id, company_id, conversation_id)?;
-        Ok(self.media_for_conversation(conversation_id))
+        let conversation = self.conversation(project_id, company_id, conversation_id)?;
+        let public_id = public_conversation_id(&conversation);
+        let mut media = self.media_for_conversation(&conversation.id);
+        for item in &mut media {
+            item.conversation_id = public_id.clone();
+        }
+        Ok(media)
     }
 
     pub fn media_for_group(
@@ -4080,8 +4822,13 @@ impl AppState {
         company_id: &str,
         conversation_id: &str,
     ) -> ApiResult<Vec<Message>> {
-        self.conversation(project_id, company_id, conversation_id)?;
-        Ok(self.starred_messages_for_conversation(conversation_id))
+        let conversation = self.conversation(project_id, company_id, conversation_id)?;
+        let public_id = public_conversation_id(&conversation);
+        let mut messages = self.starred_messages_for_conversation(&conversation.id);
+        for message in &mut messages {
+            message.conversation_id = public_id.clone();
+        }
+        Ok(messages)
     }
 
     pub fn starred_messages_for_group(
@@ -4133,8 +4880,13 @@ impl AppState {
         query: &str,
         limit: usize,
     ) -> ApiResult<Vec<Message>> {
-        self.conversation(project_id, company_id, conversation_id)?;
-        Ok(self.search_messages_for_conversation(conversation_id, query, limit))
+        let conversation = self.conversation(project_id, company_id, conversation_id)?;
+        let public_id = public_conversation_id(&conversation);
+        let mut messages = self.search_messages_for_conversation(&conversation.id, query, limit);
+        for message in &mut messages {
+            message.conversation_id = public_id.clone();
+        }
+        Ok(messages)
     }
 
     pub fn search_messages_for_group(
@@ -4250,15 +5002,14 @@ impl AppState {
         media.expires_at = None;
         media.updated_at = OffsetDateTime::now_utc();
         let updated = media.clone();
-        inner.media_blobs.remove(media_id);
         self.persist_locked(&inner);
         Ok(updated)
     }
 
     pub fn cleanup_expired_temp_media(&self) -> usize {
         let now = OffsetDateTime::now_utc();
-        let mut inner = self.inner.lock().expect("store lock poisoned");
-        let expired_ids: Vec<_> = inner
+        let inner = self.inner.lock().expect("store lock poisoned");
+        let expired_media: Vec<_> = inner
             .media
             .iter()
             .filter(|(_, media)| {
@@ -4267,16 +5018,215 @@ impl AppState {
                     "temp" | "quarantine" | "outbound-temp"
                 ) && media.expires_at.is_some_and(|expires_at| expires_at <= now)
             })
-            .map(|(media_id, _)| media_id.clone())
+            .map(|(_, media)| media.clone())
             .collect();
+        drop(inner);
+        let deleted_media: Vec<_> = expired_media
+            .into_iter()
+            .filter(|media| self.delete_media_object_bytes_best_effort(media))
+            .collect();
+        let expired_ids: HashSet<_> = deleted_media.iter().map(|media| media.id.clone()).collect();
+        let mut inner = self.inner.lock().expect("store lock poisoned");
         for media_id in &expired_ids {
             inner.media.remove(media_id);
-            inner.media_blobs.remove(media_id);
         }
         if !expired_ids.is_empty() {
             self.persist_locked(&inner);
         }
         expired_ids.len()
+    }
+
+    pub fn apply_retention_once(&self) -> RetentionSummary {
+        let now = OffsetDateTime::now_utc();
+        let companies: Vec<_> = self
+            .inner
+            .lock()
+            .expect("store lock poisoned")
+            .companies
+            .iter()
+            .map(|((project_id, company_id), value)| {
+                (
+                    project_id.clone(),
+                    company_id.clone(),
+                    company_privacy_policy(value),
+                )
+            })
+            .collect();
+
+        let mut summary = RetentionSummary::default();
+        for (project_id, company_id, policy) in companies {
+            let company_summary =
+                self.apply_company_retention(&project_id, &company_id, &policy, now);
+            if company_summary.messages_removed
+                + company_summary.transcripts_removed
+                + company_summary.transcripts_redacted
+                + company_summary.media_removed
+                > 0
+            {
+                self.audit_log(
+                    &project_id,
+                    &company_id,
+                    "retention.apply",
+                    "company",
+                    Some(&company_id),
+                    json!({
+                        "messages_removed": company_summary.messages_removed,
+                        "transcripts_removed": company_summary.transcripts_removed,
+                        "transcripts_redacted": company_summary.transcripts_redacted,
+                        "media_removed": company_summary.media_removed
+                    }),
+                );
+            }
+            summary.messages_removed += company_summary.messages_removed;
+            summary.transcripts_removed += company_summary.transcripts_removed;
+            summary.transcripts_redacted += company_summary.transcripts_redacted;
+            summary.media_removed += company_summary.media_removed;
+        }
+        summary.media_removed += self.cleanup_expired_temp_media();
+        summary
+    }
+
+    fn apply_company_retention(
+        &self,
+        project_id: &str,
+        company_id: &str,
+        policy: &CompanyPrivacyPolicy,
+        now: OffsetDateTime,
+    ) -> RetentionSummary {
+        let message_cutoff = retention_cutoff(now, policy.message_retention_days);
+        let transcript_cutoff = retention_cutoff(now, policy.transcript_retention_days);
+        let (candidate_message_ids, candidate_media) = {
+            let inner = self.inner.lock().expect("store lock poisoned");
+            let mut message_ids = HashSet::new();
+            if let Some(cutoff) = message_cutoff {
+                for (message_id, message) in &inner.messages_by_id {
+                    if message.project_id == project_id
+                        && message.company_id == company_id
+                        && message.created_at <= cutoff
+                    {
+                        message_ids.insert(message_id.clone());
+                    }
+                }
+            }
+            let media_temp_cutoff = retention_cutoff(now, policy.media_temp_retention_days);
+            let media: Vec<MediaObject> = inner
+                .media
+                .values()
+                .filter(|media| {
+                    let message_expired = media
+                        .message_id
+                        .as_deref()
+                        .is_some_and(|message_id| message_ids.contains(message_id));
+                    let temp_expired = matches!(
+                        media.storage_status.as_str(),
+                        "temp" | "quarantine" | "outbound-temp"
+                    ) && media.project_id == project_id
+                        && media.company_id == company_id
+                        && media_temp_cutoff.is_some_and(|cutoff| media.created_at <= cutoff);
+                    message_expired || temp_expired
+                })
+                .cloned()
+                .collect();
+            (message_ids, media)
+        };
+
+        let mut deleted_media = Vec::new();
+        let mut failed_message_ids = HashSet::new();
+        for media in candidate_media {
+            if self.delete_media_object_bytes_best_effort(&media) {
+                deleted_media.push(media);
+            } else if let Some(message_id) = media.message_id.as_ref() {
+                failed_message_ids.insert(message_id.clone());
+            }
+        }
+        let removable_message_ids: HashSet<_> = candidate_message_ids
+            .difference(&failed_message_ids)
+            .cloned()
+            .collect();
+        let removable_media_ids: HashSet<_> = deleted_media
+            .iter()
+            .filter(|media| {
+                media
+                    .message_id
+                    .as_ref()
+                    .is_none_or(|message_id| !failed_message_ids.contains(message_id))
+            })
+            .map(|media| media.id.clone())
+            .collect();
+
+        let mut summary = RetentionSummary {
+            messages_removed: removable_message_ids.len(),
+            media_removed: removable_media_ids.len(),
+            ..RetentionSummary::default()
+        };
+        if !removable_message_ids.is_empty() || !removable_media_ids.is_empty() {
+            let mut inner = self.inner.lock().expect("store lock poisoned");
+            inner
+                .messages_by_id
+                .retain(|message_id, _| !removable_message_ids.contains(message_id));
+            for messages in inner.messages_by_conversation.values_mut() {
+                messages.retain(|message| !removable_message_ids.contains(&message.id));
+            }
+            inner
+                .transcripts
+                .retain(|message_id, _| !removable_message_ids.contains(message_id));
+            inner
+                .media
+                .retain(|media_id, _| !removable_media_ids.contains(media_id));
+            self.persist_locked(&inner);
+        }
+
+        if let Some(cutoff) = transcript_cutoff {
+            let mut inner = self.inner.lock().expect("store lock poisoned");
+            let before = inner.transcripts.len();
+            inner.transcripts.retain(|_, transcript| {
+                !(transcript.project_id == project_id
+                    && transcript.company_id == company_id
+                    && transcript.updated_at <= cutoff)
+            });
+            let removed = before.saturating_sub(inner.transcripts.len());
+            if removed > 0 {
+                summary.transcripts_removed += removed;
+                self.persist_locked(&inner);
+            }
+        }
+
+        if !policy.allow_transcript_storage {
+            let mut inner = self.inner.lock().expect("store lock poisoned");
+            for transcript in inner.transcripts.values_mut() {
+                if transcript.project_id == project_id
+                    && transcript.company_id == company_id
+                    && (transcript.text.is_some() || !transcript.raw_response_json.is_null())
+                {
+                    transcript.text = None;
+                    transcript.raw_response_json = json!({"redacted": true});
+                    transcript.updated_at = now;
+                    summary.transcripts_redacted += 1;
+                }
+            }
+            if summary.transcripts_redacted > 0 {
+                self.persist_locked(&inner);
+            }
+        }
+        summary
+    }
+
+    fn delete_media_object_bytes_best_effort(&self, media: &MediaObject) -> bool {
+        let mut ok = true;
+        if let Some(object_key) = media.object_key.as_deref()
+            && let Err(err) = self.media_bytes.delete_blocking(object_key)
+        {
+            tracing::warn!(media_id = %media.id, object_key, error = %err, "failed to delete media object bytes");
+            ok = false;
+        }
+        if let Some(object_key) = media.permanent_object_key.as_deref()
+            && media.object_key.as_deref() != Some(object_key)
+            && let Err(err) = self.media_bytes.delete_blocking(object_key)
+        {
+            tracing::warn!(media_id = %media.id, object_key, error = %err, "failed to delete permanent media object bytes");
+            ok = false;
+        }
+        ok
     }
 
     pub fn cleanup_staging_files(&self) -> usize {
@@ -4506,15 +5456,26 @@ impl AppState {
         }
 
         self.set_transcript_lifecycle(&message, &media, TranscriptLifecycle::Processing, None)?;
-        let Some((_media, bytes)) = self.media_blob(&media_id)? else {
-            return self.set_transcript_lifecycle(
-                &message,
-                &media,
-                TranscriptLifecycle::Failed(format!(
-                    "media {media_id} has no local bytes available for STT"
-                )),
-                None,
-            );
+        let bytes = match self.media_blob(&media_id).await {
+            Ok(Some((_media, bytes))) => bytes,
+            Ok(None) => {
+                return self.set_transcript_lifecycle(
+                    &message,
+                    &media,
+                    TranscriptLifecycle::Failed(format!(
+                        "media {media_id} has no stored bytes available for STT"
+                    )),
+                    None,
+                );
+            }
+            Err(err) => {
+                return self.set_transcript_lifecycle(
+                    &message,
+                    &media,
+                    TranscriptLifecycle::Failed(err.to_string()),
+                    None,
+                );
+            }
         };
         let filename = media
             .original_filename
@@ -4551,6 +5512,10 @@ impl AppState {
             lifecycle,
             text,
         );
+        if !self.company_allows_transcript_storage(&message.project_id, &message.company_id) {
+            transcript.text = None;
+            transcript.raw_response_json = json!({"redacted": true});
+        }
         let mut inner = self.inner.lock().expect("store lock poisoned");
         if let Some(existing) = inner.transcripts.get(&message.id) {
             transcript.id = existing.id.clone();
@@ -4608,6 +5573,10 @@ impl AppState {
             Some(media.id.clone()),
             result,
         );
+        if !self.company_allows_transcript_storage(&message.project_id, &message.company_id) {
+            transcript.text = None;
+            transcript.raw_response_json = json!({"redacted": true});
+        }
         let mut inner = self.inner.lock().expect("store lock poisoned");
         if let Some(existing) = inner.transcripts.get(&message.id) {
             transcript.id = existing.id.clone();
@@ -4848,7 +5817,7 @@ impl AppState {
         company_id: &str,
         callback_id: Option<&str>,
         body: Value,
-    ) -> Value {
+    ) -> ApiResult<Value> {
         let now = OffsetDateTime::now_utc();
         let callback_id = callback_id
             .map(str::to_string)
@@ -4860,23 +5829,33 @@ impl AppState {
             .and_then(|value| value["created_at"].as_str())
             .map(str::to_string)
             .unwrap_or_else(|| ts(now));
-        let secret = body
-            .get("secret")
-            .and_then(Value::as_str)
+        let encrypted_secret = if let Some(secret) = body.get("secret").and_then(Value::as_str) {
+            Some(self.encrypt_callback_secret(secret)?)
+        } else if let Some(existing_secret) = existing
+            .as_ref()
+            .and_then(|value| value["encrypted_secret"].as_str())
             .map(str::to_string)
-            .or_else(|| {
-                existing
-                    .as_ref()
-                    .and_then(|value| value["secret"].as_str())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| format!("whsec_{}", Uuid::now_v7().simple()));
+        {
+            Some(existing_secret)
+        } else if let Some(legacy_secret) =
+            existing.as_ref().and_then(|value| value["secret"].as_str())
+        {
+            Some(self.encrypt_callback_secret(legacy_secret)?)
+        } else if self.config.secret_master_key.is_some() {
+            Some(self.encrypt_callback_secret(&format!("whsec_{}", Uuid::now_v7().simple()))?)
+        } else if self.config.webhook.delivery_enabled && self.webhook_signal_enabled() {
+            return Err(ApiError::BadRequest(
+                "RUSTZAP_SECRET_MASTER_KEY is required for webhook delivery secrets".to_string(),
+            ));
+        } else {
+            None
+        };
         let callback = json!({
             "id": callback_id,
             "project_id": project_id,
             "company_id": company_id,
             "url": body.get("url").and_then(Value::as_str).unwrap_or("http://localhost:3000/webhook"),
-            "secret": secret,
+            "encrypted_secret": encrypted_secret,
             "enabled": body.get("enabled").and_then(Value::as_bool).unwrap_or(true),
             "events": body.get("events").cloned().unwrap_or_else(|| json!(["conversation.dirty"])),
             "max_batch_size": body.get("max_batch_size").and_then(Value::as_u64).unwrap_or(self.config.webhook.max_batch_size as u64),
@@ -4895,7 +5874,70 @@ impl AppState {
             callback["id"].as_str(),
             json!({"enabled": callback["enabled"]}),
         );
-        sanitize_callback(&callback)
+        Ok(sanitize_callback(&callback))
+    }
+
+    fn encrypt_callback_secret(&self, secret: &str) -> ApiResult<String> {
+        let key = self.config.secret_master_key.as_ref().ok_or_else(|| {
+            ApiError::BadRequest(
+                "RUSTZAP_SECRET_MASTER_KEY is required to store webhook secrets".to_string(),
+            )
+        })?;
+        crate::secrets::encrypt_secret(key, secret)
+            .map_err(|err| ApiError::Internal(format!("failed to encrypt webhook secret: {err}")))
+    }
+
+    fn decrypt_callback_secret(&self, encrypted_secret: &str) -> ApiResult<String> {
+        let key = self.config.secret_master_key.as_ref().ok_or_else(|| {
+            ApiError::Internal(
+                "RUSTZAP_SECRET_MASTER_KEY is required to deliver webhook secrets".to_string(),
+            )
+        })?;
+        crate::secrets::decrypt_secret(key, encrypted_secret)
+            .map_err(|err| ApiError::Internal(format!("failed to decrypt webhook secret: {err}")))
+    }
+
+    fn upgrade_legacy_callback_secrets(&self) {
+        let Some(key) = self.config.secret_master_key.as_ref() else {
+            return;
+        };
+        let mut inner = self.inner.lock().expect("store lock poisoned");
+        let mut upgraded = 0_usize;
+        for callback in inner.callbacks.values_mut() {
+            if callback
+                .get("encrypted_secret")
+                .and_then(Value::as_str)
+                .is_some()
+            {
+                if let Some(object) = callback.as_object_mut() {
+                    object.remove("secret");
+                }
+                continue;
+            }
+            let Some(legacy_secret) = callback
+                .get("secret")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            match crate::secrets::encrypt_secret(key, &legacy_secret) {
+                Ok(encrypted_secret) => {
+                    if let Some(object) = callback.as_object_mut() {
+                        object.insert("encrypted_secret".to_string(), json!(encrypted_secret));
+                        object.remove("secret");
+                        upgraded += 1;
+                    }
+                }
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to upgrade legacy webhook secret");
+                }
+            }
+        }
+        if upgraded > 0 {
+            self.persist_locked(&inner);
+            tracing::info!(upgraded, "upgraded legacy webhook callback secrets");
+        }
     }
 
     pub fn delete_callback(
@@ -5019,13 +6061,22 @@ impl AppState {
             .as_str()
             .ok_or_else(|| ApiError::BadRequest("callback url is required".to_string()))?
             .to_string();
-        let secret = job.callback["secret"].as_str().unwrap_or_default();
+        let encrypted_secret = job
+            .callback
+            .get("encrypted_secret")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ApiError::Internal(format!(
+                    "callback {callback_id} is missing encrypted_secret"
+                ))
+            })?;
+        let secret = self.decrypt_callback_secret(encrypted_secret)?;
         let body = serde_json::to_vec(&json!({
             "events": [compact_webhook_event(&job.event)]
         }))
         .map_err(|err| ApiError::Internal(format!("failed to encode webhook body: {err}")))?;
         let timestamp = OffsetDateTime::now_utc().unix_timestamp().to_string();
-        let signature = crate::security::webhook_signature(secret, &timestamp, &body);
+        let signature = crate::security::webhook_signature(&secret, &timestamp, &body);
         let timeout_seconds = job
             .callback
             .get("timeout_seconds")
@@ -5135,9 +6186,10 @@ impl AppState {
         contact_id: &str,
     ) -> ApiResult<Value> {
         let inner = self.inner.lock().expect("store lock poisoned");
+        let contact_id = resolve_contact_id_inner(&inner, project_id, company_id, contact_id);
         let contact = inner
             .contacts
-            .get(contact_id)
+            .get(&contact_id)
             .filter(|contact| contact.project_id == project_id && contact.company_id == company_id)
             .cloned()
             .ok_or_else(|| ApiError::NotFound(format!("contact {contact_id} not found")))?;
@@ -5216,11 +6268,15 @@ impl AppState {
     ) -> ApiResult<Value> {
         let mut inner = self.inner.lock().expect("store lock poisoned");
         let now = OffsetDateTime::now_utc();
+        let resolved_contact_id =
+            resolve_contact_id_inner(&inner, project_id, company_id, contact_id);
         let contact = inner
             .contacts
-            .get_mut(contact_id)
+            .get_mut(&resolved_contact_id)
             .filter(|contact| contact.project_id == project_id && contact.company_id == company_id)
-            .ok_or_else(|| ApiError::NotFound(format!("contact {contact_id} not found")))?;
+            .ok_or_else(|| {
+                ApiError::NotFound(format!("contact {resolved_contact_id} not found"))
+            })?;
         let aliases = contact_aliases_for_record(contact);
         contact.phone_e164 = None;
         contact.push_name = None;
@@ -5244,6 +6300,7 @@ impl AppState {
             {
                 conversation.display_name = Some(anonymous_name.clone());
                 conversation.display_phone = None;
+                conversation.phone_number = None;
                 conversation.avatar_url = None;
                 conversation.profile_picture_url = None;
                 conversation.updated_at = now;
@@ -5294,11 +6351,12 @@ impl AppState {
                 "privacy.anonymize"
             },
             "contact",
-            Some(contact_id),
+            Some(&resolved_contact_id),
             json!({"pii_redacted": true, "message_text_deleted": delete_messages}),
         );
         Ok(json!({
             "contact_id": contact_id,
+            "technical_contact_id": resolved_contact_id,
             "anonymized": true,
             "deleted": delete_messages,
             "pii_redacted": true
@@ -5411,6 +6469,7 @@ fn record_message_inner(
     sender_contact_id: Option<String>,
     sender_display_name: Option<String>,
     sender_profile_picture_url: Option<String>,
+    sent_by_external_user_id: Option<String>,
     events_tx: Option<&broadcast::Sender<crate::models::CommonEvent>>,
     event_bus: Option<&EventBusHandle>,
 ) -> Message {
@@ -5492,6 +6551,9 @@ fn record_message_inner(
             group_id: is_group.then(|| conversation_id.to_string()),
             display_name: conversation_display_name.clone(),
             display_phone: conversation_display_phone.clone(),
+            phone_number: conversation_display_phone
+                .as_deref()
+                .and_then(phone_number_from_e164),
             avatar_url: if is_group {
                 group_record
                     .as_ref()
@@ -5527,6 +6589,9 @@ fn record_message_inner(
             conversation.display_name = conversation_display_name;
         }
         if conversation_display_phone.is_some() {
+            conversation.phone_number = conversation_display_phone
+                .as_deref()
+                .and_then(phone_number_from_e164);
             conversation.display_phone = conversation_display_phone;
         }
     }
@@ -5563,7 +6628,9 @@ fn record_message_inner(
         is_pinned: false,
         reaction: None,
         sent_by_source: (direction == "outbound").then(|| "rustzap_api".to_string()),
-        sent_by_external_user_id: None,
+        sent_by_external_user_id: (direction == "outbound")
+            .then_some(sent_by_external_user_id)
+            .flatten(),
         created_at_wa: now,
         created_at: now,
         updated_at: now,
@@ -5602,10 +6669,116 @@ fn record_message_inner(
             Some(conversation_id.to_string()),
             Some(message.id.clone()),
             Some(conversation_seq),
-            json!({}),
+            json!({
+                "message_id": message.id.clone(),
+                "status": message.status.clone(),
+                "delivery_state": message.delivery_state()
+            }),
         ),
     );
     message
+}
+
+fn ensure_conversation_inner(
+    inner: &mut StoreInner,
+    project_id: &str,
+    company_id: &str,
+    conversation_id: &str,
+    channel_id: &str,
+    control_mode: &str,
+) {
+    if inner.conversations.contains_key(conversation_id) {
+        return;
+    }
+
+    let now = OffsetDateTime::now_utc();
+    let is_group = conversation_id.ends_with("@g.us");
+    let contact = (!is_group).then(|| {
+        upsert_contact_inner(
+            inner,
+            ContactUpsertInput {
+                project_id,
+                company_id,
+                channel_id: Some(channel_id),
+                contact_id: conversation_id,
+                push_name: None,
+                profile_picture_url: None,
+                now,
+            },
+        )
+    });
+    let group_record = if is_group {
+        inner.groups.get(conversation_id).cloned()
+    } else {
+        None
+    };
+    let display_name = if is_group {
+        Some(
+            group_record
+                .as_ref()
+                .and_then(|group| group.subject.clone())
+                .unwrap_or_else(|| group_subject_for_jid(conversation_id)),
+        )
+    } else {
+        contact.as_ref().map(|contact| contact.display_name.clone())
+    };
+
+    inner.conversations.insert(
+        conversation_id.to_string(),
+        crate::models::Conversation {
+            id: conversation_id.to_string(),
+            project_id: project_id.to_string(),
+            company_id: company_id.to_string(),
+            channel_account_id: channel_id.to_string(),
+            conversation_type: if is_group { "group" } else { "direct" }.to_string(),
+            contact_id: if is_group {
+                None
+            } else {
+                Some(conversation_id.to_string())
+            },
+            group_id: is_group.then(|| conversation_id.to_string()),
+            display_name,
+            display_phone: if is_group {
+                None
+            } else {
+                contact
+                    .as_ref()
+                    .and_then(|contact| contact.phone_e164.clone())
+            },
+            phone_number: if is_group {
+                None
+            } else {
+                contact.as_ref().and_then(contact_phone_number)
+            },
+            avatar_url: if is_group {
+                group_record
+                    .as_ref()
+                    .and_then(|group| group.avatar_url.clone())
+            } else {
+                contact
+                    .as_ref()
+                    .and_then(|contact| contact.avatar_url.clone())
+            },
+            profile_picture_url: if is_group {
+                group_record
+                    .as_ref()
+                    .and_then(|group| group.profile_picture_url.clone())
+            } else {
+                contact
+                    .as_ref()
+                    .and_then(|contact| contact.profile_picture_url.clone())
+            },
+            last_seq: 0,
+            last_message_at: None,
+            unread_count: 0,
+            is_archived: false,
+            is_muted: false,
+            is_pinned: false,
+            control_mode: control_mode.to_string(),
+            created_at: now,
+            updated_at: now,
+        },
+    );
 }
 
 fn attach_media_to_message_inner(
@@ -5912,12 +7085,61 @@ fn contact_aliases_for_inner(
     company_id: &str,
     contact_id: &str,
 ) -> ApiResult<Vec<String>> {
+    let contact_id = resolve_contact_id_inner(inner, project_id, company_id, contact_id);
     inner
         .contacts
-        .get(contact_id)
+        .get(&contact_id)
         .filter(|contact| contact.project_id == project_id && contact.company_id == company_id)
         .map(contact_aliases_for_record)
         .ok_or_else(|| ApiError::NotFound(format!("contact {contact_id} not found")))
+}
+
+fn contact_id_for_phone_number_inner(
+    inner: &StoreInner,
+    project_id: &str,
+    company_id: &str,
+    phone_number: &str,
+) -> Option<String> {
+    let mut ids: Vec<_> = inner
+        .contacts
+        .values()
+        .filter(|contact| {
+            contact.project_id == project_id
+                && contact.company_id == company_id
+                && contact_phone_number(contact).as_deref() == Some(phone_number)
+        })
+        .map(|contact| contact.id.clone())
+        .collect();
+    ids.sort_by_key(|id| (!id.ends_with("@lid"), id.clone()));
+    ids.into_iter().next()
+}
+
+fn resolve_contact_id_inner(
+    inner: &StoreInner,
+    project_id: &str,
+    company_id: &str,
+    contact_id: &str,
+) -> String {
+    let trimmed = contact_id.trim();
+    if inner
+        .contacts
+        .get(trimmed)
+        .is_some_and(|contact| contact.project_id == project_id && contact.company_id == company_id)
+    {
+        return trimmed.to_string();
+    }
+    let phone_number = phone_number_from_jid(trimmed).or_else(|| {
+        (!trimmed.contains('@'))
+            .then(|| phone_number_from_value(trimmed))
+            .flatten()
+    });
+    if let Some(phone_number) = phone_number
+        && let Some(contact_id) =
+            contact_id_for_phone_number_inner(inner, project_id, company_id, &phone_number)
+    {
+        return contact_id;
+    }
+    trimmed.to_string()
 }
 
 fn connected_channel_for_project_company(
@@ -5941,6 +7163,9 @@ fn apply_contact_to_conversation(
     conversation.display_name = Some(contact.display_name.clone());
     if contact.phone_e164.is_some() {
         conversation.display_phone = contact.phone_e164.clone();
+    }
+    if let Some(phone_number) = contact_phone_number(contact) {
+        conversation.phone_number = Some(phone_number);
     }
     if contact.avatar_url.is_some() {
         conversation.avatar_url = contact.avatar_url.clone();
@@ -6005,6 +7230,7 @@ fn group_conversation(
         group_id: Some(group_id.to_string()),
         display_name: Some(group_subject_for_jid(group_id)),
         display_phone: None,
+        phone_number: None,
         avatar_url: None,
         profile_picture_url: None,
         last_seq: 0,
@@ -6028,6 +7254,7 @@ fn apply_group_record_to_conversation(
     conversation.contact_id = None;
     conversation.group_id = Some(group_id.to_string());
     conversation.display_phone = None;
+    conversation.phone_number = None;
     conversation.display_name = Some(
         group
             .and_then(|group| group.subject.clone())
@@ -6086,6 +7313,7 @@ fn upsert_group_member_metadata_inner(
     inner: &mut StoreInner,
     group_id: &str,
     contact_id: &str,
+    phone_jid: Option<&str>,
     display_name: &str,
     owner_jid: Option<&str>,
     is_admin: bool,
@@ -6105,7 +7333,9 @@ fn upsert_group_member_metadata_inner(
         .entry(contact_id.to_string())
         .and_modify(|member| {
             member.wa_jid = Some(contact_id.to_string());
-            member.phone_e164 = phone_from_jid(contact_id);
+            member.phone_e164 = phone_jid
+                .and_then(phone_from_jid)
+                .or_else(|| phone_from_jid(contact_id));
             if should_replace_group_member_name(&member.display_name, contact_id) {
                 member.display_name = display_name.to_string();
             }
@@ -6118,7 +7348,9 @@ fn upsert_group_member_metadata_inner(
             group_id: group_id.to_string(),
             contact_id: contact_id.to_string(),
             wa_jid: Some(contact_id.to_string()),
-            phone_e164: phone_from_jid(contact_id),
+            phone_e164: phone_jid
+                .and_then(phone_from_jid)
+                .or_else(|| phone_from_jid(contact_id)),
             display_name: display_name.to_string(),
             role: role.to_string(),
             is_admin: is_admin || role == "owner",
@@ -6149,6 +7381,11 @@ fn phone_to_jid(phone_e164: &str) -> String {
     }
 }
 
+fn phone_number_from_value(value: &str) -> Option<String> {
+    let digits: String = value.chars().filter(|ch| ch.is_ascii_digit()).collect();
+    (!digits.is_empty()).then_some(digits)
+}
+
 fn phone_from_jid(jid: &str) -> Option<String> {
     let local = jid.split('@').next().unwrap_or(jid);
     if jid.ends_with("@s.whatsapp.net") && local.chars().all(|ch| ch.is_ascii_digit()) {
@@ -6156,6 +7393,33 @@ fn phone_from_jid(jid: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn phone_number_from_jid(jid: &str) -> Option<String> {
+    let local = jid.split('@').next().unwrap_or(jid);
+    if jid.ends_with("@s.whatsapp.net") && local.chars().all(|ch| ch.is_ascii_digit()) {
+        Some(local.to_string())
+    } else {
+        None
+    }
+}
+
+fn phone_number_from_e164(phone_e164: &str) -> Option<String> {
+    phone_number_from_value(phone_e164)
+}
+
+fn contact_phone_number(contact: &ContactRecord) -> Option<String> {
+    contact
+        .phone_e164
+        .as_deref()
+        .and_then(phone_number_from_e164)
+        .or_else(|| {
+            contact
+                .canonical_jid
+                .as_deref()
+                .and_then(phone_number_from_jid)
+        })
+        .or_else(|| phone_number_from_jid(&contact.id))
 }
 
 fn display_name_for_jid(jid: &str) -> String {
@@ -6256,6 +7520,32 @@ pub fn dev_preview_svg(media: &MediaObject, message: &Message) -> String {
     )
 }
 
+fn dev_media_bytes(media: &MediaObject, message: &Message) -> Vec<u8> {
+    let mime_type = media
+        .mime_type
+        .split(';')
+        .next()
+        .unwrap_or(&media.mime_type)
+        .trim();
+    match mime_type {
+        "image/png" => BASE64_STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=")
+            .unwrap_or_else(|_| dev_preview_svg(media, message).into_bytes()),
+        "image/svg+xml" => dev_preview_svg(media, message).into_bytes(),
+        "audio/ogg" | "audio/webm" => {
+            let mut bytes = b"OggS\0\x02rustzap-dev-audio:".to_vec();
+            bytes.extend_from_slice(media.id.as_bytes());
+            bytes
+        }
+        "application/pdf" => format!(
+            "%PDF-1.4\n% RustZap dev media {}\n1 0 obj<</Type/Catalog>>endobj\n%%EOF\n",
+            media.id
+        )
+        .into_bytes(),
+        _ => format!("RustZap dev media {}\nmessage={}\n", media.id, message.id).into_bytes(),
+    }
+}
+
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -6265,11 +7555,14 @@ fn xml_escape(value: &str) -> String {
 }
 
 fn contact_json(contact: &ContactRecord) -> Value {
+    let phone_number = contact_phone_number(contact);
     json!({
-        "id": contact.id,
+        "id": phone_number.as_deref().unwrap_or(&contact.id),
+        "technical_id": contact.id,
         "canonical_jid": contact.canonical_jid,
         "lid": contact.lid,
         "phone_e164": contact.phone_e164,
+        "phone_number": phone_number,
         "push_name": contact.push_name,
         "display_name": contact.display_name,
         "profile_picture_media_id": contact.profile_picture_media_id,
@@ -6337,18 +7630,146 @@ fn is_updates_event_surface(
         || recipient_alt_jid.is_some_and(is_updates_surface_jid)
 }
 
+fn conversation_matches_tenant(
+    conversation: &crate::models::Conversation,
+    project_id: &str,
+    company_id: &str,
+) -> bool {
+    conversation.project_id == project_id && conversation.company_id == company_id
+}
+
+fn conversation_phone_number_for_inner(
+    inner: &StoreInner,
+    conversation: &crate::models::Conversation,
+) -> Option<String> {
+    if conversation.conversation_type == "group" {
+        return None;
+    }
+    conversation
+        .phone_number
+        .clone()
+        .or_else(|| {
+            conversation
+                .display_phone
+                .as_deref()
+                .and_then(phone_number_from_e164)
+        })
+        .or_else(|| phone_number_from_jid(&conversation.id))
+        .or_else(|| {
+            conversation
+                .contact_id
+                .as_deref()
+                .and_then(|contact_id| inner.contacts.get(contact_id))
+                .and_then(contact_phone_number)
+        })
+        .or_else(|| {
+            inner
+                .contacts
+                .get(&conversation.id)
+                .and_then(contact_phone_number)
+        })
+}
+
+fn apply_public_conversation_fields(
+    inner: &StoreInner,
+    conversation: &mut crate::models::Conversation,
+) {
+    if conversation.conversation_type == "group" {
+        conversation.phone_number = None;
+        return;
+    }
+    if let Some(phone_number) = conversation_phone_number_for_inner(inner, conversation) {
+        if conversation.display_phone.is_none() {
+            conversation.display_phone = Some(format!("+{phone_number}"));
+        }
+        conversation.phone_number = Some(phone_number);
+    }
+}
+
+fn public_conversation_id(conversation: &crate::models::Conversation) -> String {
+    conversation
+        .phone_number
+        .clone()
+        .unwrap_or_else(|| conversation.id.clone())
+}
+
+fn conversation_id_for_phone_number_inner(
+    inner: &StoreInner,
+    project_id: &str,
+    company_id: &str,
+    phone_number: &str,
+) -> Option<String> {
+    let mut aliases = Vec::new();
+    for contact in inner.contacts.values().filter(|contact| {
+        contact.project_id == project_id
+            && contact.company_id == company_id
+            && contact_phone_number(contact).as_deref() == Some(phone_number)
+    }) {
+        if let Some(lid) = contact.lid.as_deref() {
+            aliases.push(lid.to_string());
+        }
+        if let Some(canonical_jid) = contact.canonical_jid.as_deref() {
+            aliases.push(canonical_jid.to_string());
+        }
+        aliases.push(contact.id.clone());
+    }
+    aliases.push(phone_to_jid(phone_number));
+    aliases.sort();
+    aliases.dedup();
+    aliases.into_iter().find(|alias| {
+        inner.conversations.get(alias).is_some_and(|conversation| {
+            conversation_matches_tenant(conversation, project_id, company_id)
+        })
+    })
+}
+
+fn resolve_conversation_id_inner(
+    inner: &StoreInner,
+    project_id: &str,
+    company_id: &str,
+    conversation_id: &str,
+) -> String {
+    let trimmed = conversation_id.trim();
+    if inner
+        .conversations
+        .get(trimmed)
+        .is_some_and(|conversation| {
+            conversation_matches_tenant(conversation, project_id, company_id)
+        })
+    {
+        return trimmed.to_string();
+    }
+
+    let phone_number = phone_number_from_jid(trimmed).or_else(|| {
+        (!trimmed.contains('@'))
+            .then(|| phone_number_from_value(trimmed))
+            .flatten()
+    });
+    if let Some(phone_number) = phone_number {
+        return conversation_id_for_phone_number_inner(
+            inner,
+            project_id,
+            company_id,
+            &phone_number,
+        )
+        .unwrap_or_else(|| phone_to_jid(&phone_number));
+    }
+
+    trimmed.to_string()
+}
+
 fn conversation_for_inner<'a>(
     inner: &'a StoreInner,
     project_id: &str,
     company_id: &str,
     conversation_id: &str,
 ) -> ApiResult<&'a crate::models::Conversation> {
+    let conversation_id =
+        resolve_conversation_id_inner(inner, project_id, company_id, conversation_id);
     inner
         .conversations
-        .get(conversation_id)
-        .filter(|conversation| {
-            conversation.project_id == project_id && conversation.company_id == company_id
-        })
+        .get(&conversation_id)
+        .filter(|conversation| conversation_matches_tenant(conversation, project_id, company_id))
         .ok_or_else(|| ApiError::NotFound("conversation not found".to_string()))
 }
 
@@ -6368,11 +7789,19 @@ fn group_member_values_for_inner(inner: &StoreInner, group_id: &str) -> Vec<Valu
 }
 
 fn group_member_json(member: &GroupMemberRecord) -> Value {
+    let phone_number = member
+        .phone_e164
+        .as_deref()
+        .and_then(phone_number_from_e164)
+        .or_else(|| member.wa_jid.as_deref().and_then(phone_number_from_jid))
+        .or_else(|| phone_number_from_jid(&member.contact_id));
     json!({
         "group_id": member.group_id,
-        "contact_id": member.contact_id,
+        "contact_id": phone_number.as_deref().unwrap_or(&member.contact_id),
+        "technical_contact_id": member.contact_id,
         "wa_jid": member.wa_jid,
         "phone_e164": member.phone_e164,
+        "phone_number": phone_number,
         "name": member.display_name,
         "display_name": member.display_name,
         "role": member.role,
@@ -6447,10 +7876,18 @@ fn push_event_inner(
     inner.events.push(event);
 }
 
+fn internal_work_event_type(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "outbound.send.requested" | "audio.transcription.requested"
+    )
+}
+
 fn sanitize_callback(callback: &Value) -> Value {
     let mut sanitized = callback.clone();
     if let Some(object) = sanitized.as_object_mut() {
         object.remove("secret");
+        object.remove("encrypted_secret");
     }
     sanitized
 }
@@ -6580,12 +8017,23 @@ mod tests {
         };
 
         let outcome = state
-            .prepare_send_message("p", "c", "conv", "idem-async", req)
+            .prepare_send_message("p", "c", "conv", "idem-async", req, None)
             .unwrap();
 
         assert!(outcome.should_dispatch);
         assert_eq!(outcome.message.status, "queued");
+        let serialized_message = serde_json::to_value(&outcome.message).unwrap();
+        assert_eq!(serialized_message["delivery_state"], "pending");
         let events = state.events();
+        let queued = events
+            .iter()
+            .find(|event| {
+                event.event_type == "message.queued"
+                    && event.message_id.as_deref() == Some(outcome.message.id.as_str())
+            })
+            .expect("queued message event should be emitted");
+        assert_eq!(queued.payload["status"], "queued");
+        assert_eq!(queued.payload["delivery_state"], "pending");
         let requested = events
             .iter()
             .find(|event| event.event_type == "outbound.send.requested")
@@ -6619,7 +8067,7 @@ mod tests {
         };
 
         let outcome = state
-            .prepare_send_message("p", "c", "conv_worker", "idem-worker", req)
+            .prepare_send_message("p", "c", "conv_worker", "idem-worker", req, None)
             .unwrap();
         let event = state
             .events()
@@ -6633,6 +8081,8 @@ mod tests {
         let updated = state.process_outbound_send_request(&event).await.unwrap();
 
         assert_eq!(updated.status, "failed");
+        let serialized_message = serde_json::to_value(&updated).unwrap();
+        assert_eq!(serialized_message["delivery_state"], "failed");
         assert!(
             updated
                 .error_message
@@ -6643,7 +8093,59 @@ mod tests {
         assert!(events.iter().any(|event| {
             event.event_type == "message.failed"
                 && event.message_id.as_deref() == Some(outcome.message.id.as_str())
+                && event.payload["status"] == "failed"
+                && event.payload["delivery_state"] == "failed"
         }));
+    }
+
+    #[test]
+    fn receipt_updates_delivery_state_and_emits_public_payload() {
+        let state = AppState::new(AppConfig::from_env());
+        let outcome = state
+            .prepare_send_message(
+                "p",
+                "c",
+                "conv_receipt",
+                "idem-receipt",
+                SendMessageRequest {
+                    message_type: "text".to_string(),
+                    text: Some("receipt path".to_string()),
+                    media_id: None,
+                    caption: None,
+                    filename: None,
+                    quoted_message_id: None,
+                    metadata: None,
+                },
+                None,
+            )
+            .unwrap();
+
+        state
+            .update_outbound_after_dispatch(
+                &outcome.message.id,
+                Some("wa_receipt_1".to_string()),
+                "sent_to_whatsapp",
+                None,
+            )
+            .unwrap();
+        let updated = state
+            .update_receipt_by_wa_id("wa_receipt_1", "played")
+            .unwrap();
+        assert_eq!(updated.status, "played");
+        let serialized_message = serde_json::to_value(&updated).unwrap();
+        assert_eq!(serialized_message["delivery_state"], "read");
+
+        let receipt = state
+            .events()
+            .into_iter()
+            .find(|event| {
+                event.event_type == "message.receipt"
+                    && event.message_id.as_deref() == Some(updated.id.as_str())
+            })
+            .expect("receipt event should be emitted");
+        assert_eq!(receipt.payload["status"], "played");
+        assert_eq!(receipt.payload["delivery_state"], "read");
+        assert_eq!(receipt.payload["receipt_type"], "played");
     }
 
     #[tokio::test]
@@ -6664,6 +8166,7 @@ mod tests {
                     quoted_message_id: None,
                     metadata: None,
                 },
+                None,
             )
             .unwrap();
         let event = state
@@ -6734,8 +8237,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn downloaded_inbound_audio_media_is_stored_and_queues_transcription() {
+    #[tokio::test]
+    async fn downloaded_inbound_audio_media_is_stored_and_queues_transcription() {
         let mut config = AppConfig::from_env();
         config.media_local_temp_dir = std::env::temp_dir().join(format!(
             "rustzap-inbound-media-test-{}",
@@ -6785,7 +8288,7 @@ mod tests {
         assert_eq!(media.media_type, "audio");
         assert_eq!(media.storage_status, "temp");
         assert_eq!(media.duration_seconds, Some(1.5));
-        let (_stored, stored_bytes) = state.media_blob(&media.id).unwrap().unwrap();
+        let (_stored, stored_bytes) = state.media_blob(&media.id).await.unwrap().unwrap();
         assert_eq!(stored_bytes, bytes);
         let events = state.events();
         assert!(events.iter().any(|event| {
@@ -6919,6 +8422,386 @@ mod tests {
         }));
     }
 
+    #[tokio::test]
+    async fn in_memory_dispatcher_processes_outbound_send_requests_after_queueing() {
+        let mut config = AppConfig::from_env();
+        config.event_bus = EventBusMode::InMemory;
+        let state = AppState::from_config(config).await.unwrap();
+        let outcome = state
+            .prepare_send_message(
+                "p",
+                "c",
+                "conv_local_dispatch",
+                "idem-local-dispatch",
+                SendMessageRequest {
+                    message_type: "text".to_string(),
+                    text: Some("queued local dispatch".to_string()),
+                    media_id: None,
+                    caption: None,
+                    filename: None,
+                    quoted_message_id: None,
+                    metadata: None,
+                },
+                None,
+            )
+            .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+
+        let message = state
+            .message_for_company("p", "c", &outcome.message.id)
+            .unwrap();
+        assert_eq!(message.status, "failed");
+        assert!(
+            message
+                .error_message
+                .as_deref()
+                .is_some_and(|error| error.contains("not connected"))
+        );
+    }
+
+    #[tokio::test]
+    async fn persisted_store_serializes_media_metadata_without_media_bytes() {
+        let mut config = AppConfig::from_env();
+        config.media_local_temp_dir = std::env::temp_dir().join(format!(
+            "rustzap-no-media-blobs-test-{}",
+            Uuid::now_v7().simple()
+        ));
+        let state = AppState::new(config);
+        let media = state
+            .upload_outbound_media(
+                "p",
+                "c",
+                OutboundMediaUpload {
+                    conversation_id: "conv_bytes".to_string(),
+                    media_type: Some("image".to_string()),
+                    mime_type: Some("image/png".to_string()),
+                    filename: Some("photo.png".to_string()),
+                    caption: None,
+                    bytes: b"\x89PNG\r\n\x1a\nsensitive-media-bytes".to_vec(),
+                },
+            )
+            .await
+            .unwrap();
+        let inner = state.inner.lock().expect("store lock poisoned");
+        let snapshot = PersistedStore::from_inner(&inner);
+        let json = serde_json::to_value(snapshot).unwrap();
+
+        assert!(json.get("media_blobs").is_none());
+        assert_eq!(
+            json["media"][&media.id]["object_key"].as_str(),
+            media.object_key.as_deref()
+        );
+        assert!(!json.to_string().contains("sensitive-media-bytes"));
+    }
+
+    #[test]
+    fn persisted_store_creates_placeholder_conversation_for_orphan_media() {
+        let now = OffsetDateTime::now_utc();
+        let mut inner = StoreInner::default();
+        let conversation_id = "5511888777666@s.whatsapp.net";
+        inner.channels.insert(
+            "ch_live".to_string(),
+            json!({
+                "id": "ch_live",
+                "project_id": "p",
+                "company_id": "c",
+                "provider": "whatsapp-rust",
+                "status": "connected",
+                "created_at": ts(now),
+                "updated_at": ts(now)
+            }),
+        );
+        inner.media.insert(
+            "media_orphan".to_string(),
+            MediaObject {
+                id: "media_orphan".to_string(),
+                project_id: "p".to_string(),
+                company_id: "c".to_string(),
+                conversation_id: conversation_id.to_string(),
+                message_id: None,
+                media_type: "image".to_string(),
+                mime_type: "image/png".to_string(),
+                original_filename: Some("probe.png".to_string()),
+                size_bytes: 68,
+                sha256: "sha".to_string(),
+                storage_status: "outbound-temp".to_string(),
+                bucket: Some("devbucket".to_string()),
+                object_key: Some("object-key".to_string()),
+                permanent_object_key: None,
+                public_url: None,
+                thumbnail_url: None,
+                width: None,
+                height: None,
+                duration_seconds: None,
+                expires_at: None,
+                saved_at: None,
+                created_at: now,
+                updated_at: now,
+            },
+        );
+
+        let persisted = PersistedStore::from_inner(&inner);
+        let conversation = persisted.conversations.get(conversation_id).unwrap();
+
+        assert_eq!(conversation.project_id, "p");
+        assert_eq!(conversation.company_id, "c");
+        assert_eq!(conversation.channel_account_id, "ch_live");
+        assert_eq!(conversation.contact_id.as_deref(), Some(conversation_id));
+        assert_eq!(conversation.last_seq, 0);
+        assert_eq!(conversation.control_mode, "manual");
+    }
+
+    #[test]
+    fn callback_secret_is_persisted_encrypted_not_plaintext() {
+        let mut config = AppConfig::from_env();
+        config.secret_master_key = Some(crate::secrets::SecretMasterKey::from_raw_32(
+            *b"0123456789abcdef0123456789abcdef",
+        ));
+        let state = AppState::new(config);
+
+        let callback = state
+            .upsert_callback(
+                "p",
+                "c",
+                Some("callback_secret_test"),
+                json!({
+                    "url": "http://localhost/hook",
+                    "secret": "webhook_secret",
+                    "enabled": true
+                }),
+            )
+            .unwrap();
+
+        assert!(callback.get("secret").is_none());
+        assert!(callback.get("encrypted_secret").is_none());
+        let inner = state.inner.lock().expect("store lock poisoned");
+        let stored = inner.callbacks.get("callback_secret_test").unwrap();
+        assert!(stored.get("secret").is_none());
+        let encrypted = stored["encrypted_secret"].as_str().unwrap();
+        assert!(encrypted.starts_with("rzsec:v1:"));
+        assert!(!encrypted.contains("webhook_secret"));
+    }
+
+    #[test]
+    fn callback_upsert_encrypts_legacy_plaintext_secret() {
+        let mut config = AppConfig::from_env();
+        config.secret_master_key = Some(crate::secrets::SecretMasterKey::from_raw_32(
+            *b"0123456789abcdef0123456789abcdef",
+        ));
+        let state = AppState::new(config);
+        state
+            .inner
+            .lock()
+            .expect("store lock poisoned")
+            .callbacks
+            .insert(
+                "legacy_callback".to_string(),
+                json!({
+                    "id": "legacy_callback",
+                    "project_id": "p",
+                    "company_id": "c",
+                    "url": "http://localhost/hook",
+                    "secret": "legacy_secret",
+                    "enabled": true,
+                    "events": ["conversation.dirty"]
+                }),
+            );
+
+        state
+            .upsert_callback(
+                "p",
+                "c",
+                Some("legacy_callback"),
+                json!({"url": "http://localhost/hook"}),
+            )
+            .unwrap();
+
+        let inner = state.inner.lock().expect("store lock poisoned");
+        let stored = inner.callbacks.get("legacy_callback").unwrap();
+        assert!(stored.get("secret").is_none());
+        assert!(
+            stored["encrypted_secret"]
+                .as_str()
+                .unwrap()
+                .starts_with("rzsec:v1:")
+        );
+        assert!(!stored.to_string().contains("legacy_secret"));
+    }
+
+    #[test]
+    fn startup_upgrade_encrypts_legacy_callback_secret_without_upsert() {
+        let mut config = AppConfig::from_env();
+        config.secret_master_key = Some(crate::secrets::SecretMasterKey::from_raw_32(
+            *b"0123456789abcdef0123456789abcdef",
+        ));
+        let state = AppState::new(config);
+        state
+            .inner
+            .lock()
+            .expect("store lock poisoned")
+            .callbacks
+            .insert(
+                "legacy_startup_callback".to_string(),
+                json!({
+                    "id": "legacy_startup_callback",
+                    "project_id": "p",
+                    "company_id": "c",
+                    "url": "http://localhost/hook",
+                    "secret": "legacy_secret",
+                    "enabled": true,
+                    "events": ["conversation.dirty"]
+                }),
+            );
+
+        state.upgrade_legacy_callback_secrets();
+
+        let inner = state.inner.lock().expect("store lock poisoned");
+        let stored = inner.callbacks.get("legacy_startup_callback").unwrap();
+        assert!(stored.get("secret").is_none());
+        assert!(
+            stored["encrypted_secret"]
+                .as_str()
+                .unwrap()
+                .starts_with("rzsec:v1:")
+        );
+    }
+
+    #[test]
+    fn retention_removes_old_messages_and_audits_aggregate_counts() {
+        let state = AppState::new(AppConfig::from_env());
+        state.upsert_company("p".to_string(), "c".to_string(), "Company".to_string());
+        let message = state.receive_inbound_text(
+            "p",
+            "c",
+            SimulateInboundTextRequest {
+                conversation_id: Some("conv_retention".to_string()),
+                channel_id: Some("ch_retention".to_string()),
+                from_phone_e164: None,
+                sender_name: None,
+                profile_picture_url: None,
+                text: "old private text".to_string(),
+            },
+        );
+        {
+            let mut inner = state.inner.lock().expect("store lock poisoned");
+            inner
+                .companies
+                .get_mut(&("p".to_string(), "c".to_string()))
+                .unwrap()["privacy"]["message_retention_days"] = json!(1);
+            let old = OffsetDateTime::now_utc() - Duration::days(2);
+            inner
+                .messages_by_id
+                .get_mut(&message.id)
+                .unwrap()
+                .created_at = old;
+            inner
+                .messages_by_conversation
+                .get_mut("conv_retention")
+                .unwrap()[0]
+                .created_at = old;
+        }
+
+        let summary = state.apply_retention_once();
+
+        assert_eq!(summary.messages_removed, 1);
+        assert!(state.message_for_company("p", "c", &message.id).is_err());
+        let audit_logs = &state.inner.lock().expect("store lock poisoned").audit_logs;
+        assert!(audit_logs.iter().any(|entry| {
+            entry["action"] == "retention.apply"
+                && entry["response_json"]["messages_removed"] == json!(1)
+                && !entry.to_string().contains("old private text")
+        }));
+    }
+
+    #[tokio::test]
+    async fn retention_removes_local_media_bytes_with_metadata() {
+        let mut config = AppConfig::from_env();
+        config.local_storage_dir = std::env::temp_dir().join(format!(
+            "rustzap-retention-byte-delete-test-{}",
+            Uuid::now_v7().simple()
+        ));
+        let state = AppState::new(config);
+        state.upsert_company("p".to_string(), "c".to_string(), "Company".to_string());
+        let media = state
+            .upload_outbound_media(
+                "p",
+                "c",
+                OutboundMediaUpload {
+                    conversation_id: "conv_media_retention".to_string(),
+                    media_type: Some("document".to_string()),
+                    mime_type: Some("text/plain".to_string()),
+                    filename: Some("file.txt".to_string()),
+                    caption: None,
+                    bytes: b"retained bytes".to_vec(),
+                },
+            )
+            .await
+            .unwrap();
+        let object_key = media.object_key.clone().unwrap();
+        let object_path = state.config.local_storage_dir.join(&object_key);
+        assert!(object_path.exists());
+        {
+            let mut inner = state.inner.lock().expect("store lock poisoned");
+            inner
+                .companies
+                .get_mut(&("p".to_string(), "c".to_string()))
+                .unwrap()["privacy"]["media_temp_retention_days"] = json!(1);
+            inner.media.get_mut(&media.id).unwrap().created_at =
+                OffsetDateTime::now_utc() - Duration::days(2);
+        }
+
+        let summary = state.apply_retention_once();
+
+        assert_eq!(summary.media_removed, 1);
+        assert!(state.media(&media.id).is_err());
+        assert!(!object_path.exists());
+    }
+
+    #[test]
+    fn transcript_storage_policy_redacts_completed_text_and_raw_response() {
+        let state = AppState::new(AppConfig::from_env());
+        state.upsert_company("p".to_string(), "c".to_string(), "Company".to_string());
+        let (message, media, _transcript) = state.receive_inbound_media(
+            "p",
+            "c",
+            SimulateInboundMediaRequest {
+                conversation_id: Some("conv_transcript_policy".to_string()),
+                channel_id: Some("ch_transcript_policy".to_string()),
+                from_phone_e164: None,
+                sender_name: None,
+                profile_picture_url: None,
+                media_type: Some("audio".to_string()),
+                mime_type: Some("audio/ogg".to_string()),
+                filename: Some("voice.ogg".to_string()),
+                caption: None,
+                size_bytes: Some(100),
+            },
+        );
+        state
+            .inner
+            .lock()
+            .expect("store lock poisoned")
+            .companies
+            .get_mut(&("p".to_string(), "c".to_string()))
+            .unwrap()["privacy"]["allow_transcript_storage"] = json!(false);
+
+        let transcript = state
+            .set_completed_groq_transcript(
+                &message,
+                &media,
+                crate::transcription::GroqTranscription {
+                    text: "private transcript".to_string(),
+                    raw_response_json: json!({"text": "private transcript"}),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(transcript.status, "completed");
+        assert!(transcript.text.is_none());
+        assert_eq!(transcript.raw_response_json, json!({"redacted": true}));
+    }
+
     #[test]
     fn raw_whatsapp_enqueue_rejects_qr_pairing_secrets() {
         let state = AppState::new(AppConfig::from_env());
@@ -6934,6 +8817,36 @@ mod tests {
 
         assert!(matches!(err, ApiError::BadRequest(_)));
         assert!(state.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn outbound_upload_creates_placeholder_conversation_for_new_jid() {
+        let state = AppState::new(AppConfig::from_env());
+        let conversation_id = "5511888777666@s.whatsapp.net";
+        let bytes = b"rustzap outbound bytes".to_vec();
+
+        let media = state
+            .upload_outbound_media(
+                "p",
+                "c",
+                OutboundMediaUpload {
+                    conversation_id: conversation_id.to_string(),
+                    media_type: Some("document".to_string()),
+                    mime_type: Some("text/plain".to_string()),
+                    filename: Some("arquivo.txt".to_string()),
+                    caption: None,
+                    bytes: bytes.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let conversation = state.conversation("p", "c", conversation_id).unwrap();
+        assert_eq!(conversation.id, conversation_id);
+        assert_eq!(conversation.channel_account_id, "channel_dev");
+        assert_eq!(conversation.last_seq, 0);
+        assert_eq!(media.conversation_id, conversation_id);
+        assert_eq!(media.sha256, hex::encode(Sha256::digest(&bytes)));
     }
 
     #[tokio::test]
@@ -6969,7 +8882,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(state.media_blob(&media.id).unwrap().unwrap().1, bytes);
+        assert_eq!(state.media_blob(&media.id).await.unwrap().unwrap().1, bytes);
         assert!(
             media
                 .object_key
@@ -6993,6 +8906,7 @@ mod tests {
                     quoted_message_id: None,
                     metadata: None,
                 },
+                None,
             )
             .unwrap();
 
@@ -7188,18 +9102,23 @@ mod tests {
         let mut config = AppConfig::from_env();
         config.consumer_signal_mode = crate::config::ConsumerSignalMode::Webhook;
         config.webhook.delivery_enabled = true;
+        config.secret_master_key = Some(crate::secrets::SecretMasterKey::from_raw_32(
+            *b"0123456789abcdef0123456789abcdef",
+        ));
         let state = AppState::new(config);
-        state.upsert_callback(
-            "p",
-            "c",
-            None,
-            json!({
-                "url": format!("http://{addr}/hook"),
-                "secret": "webhook_secret",
-                "events": ["conversation.dirty"],
-                "enabled": true
-            }),
-        );
+        state
+            .upsert_callback(
+                "p",
+                "c",
+                None,
+                json!({
+                    "url": format!("http://{addr}/hook"),
+                    "secret": "webhook_secret",
+                    "events": ["conversation.dirty"],
+                    "enabled": true
+                }),
+            )
+            .unwrap();
         state.receive_inbound_text(
             "p",
             "c",
@@ -7409,6 +9328,7 @@ mod tests {
                 "5511999999999@s.whatsapp.net",
                 "send-fast-fail",
                 request,
+                None,
             )
             .unwrap();
 
@@ -7462,6 +9382,7 @@ mod tests {
                 "5511999999999@s.whatsapp.net",
                 "send-stale-channel",
                 request,
+                None,
             )
             .unwrap();
 
@@ -7481,6 +9402,37 @@ mod tests {
         assert_eq!(state.channel("ch")["status"], "disconnected");
         assert_eq!(state.channel_connected_at("ch"), None);
         assert_eq!(state.qr("ch").status, "disconnected");
+    }
+
+    #[test]
+    fn channel_status_reports_disconnected_when_runtime_is_gone() {
+        let state = AppState::new(AppConfig::from_env());
+        state.create_channel("p", "c", Some("ch".to_string()), None, None);
+        let connected_at = OffsetDateTime::now_utc();
+        state.set_channel_status("ch", "connected", Some(connected_at));
+
+        let channel = state.channel("ch");
+
+        assert_eq!(channel["status"], "disconnected");
+        assert_eq!(channel["connected_at"], Value::Null);
+        assert_eq!(state.qr("ch").status, "disconnected");
+        assert!(state.events().iter().any(|event| {
+            event.event_type == "channel.disconnected" && event.channel_id.as_deref() == Some("ch")
+        }));
+    }
+
+    #[test]
+    fn qr_status_reports_disconnected_when_runtime_is_gone() {
+        let state = AppState::new(AppConfig::from_env());
+        state.create_channel("p", "c", Some("ch".to_string()), None, None);
+        let connected_at = OffsetDateTime::now_utc();
+        state.set_channel_status("ch", "connected", Some(connected_at));
+
+        let qr = state.qr("ch");
+
+        assert_eq!(qr.status, "disconnected");
+        assert_eq!(qr.qr_code_text, None);
+        assert_eq!(state.channel("ch")["status"], "disconnected");
     }
 
     #[test]
@@ -7625,6 +9577,25 @@ mod tests {
             Some("https://example.test/profile.jpg")
         );
         assert_eq!(conversation.unread_count, 1);
+
+        let serialized = serde_json::to_value(&conversation).unwrap();
+        assert_eq!(serialized["phone_number"], "5511999999999");
+
+        let contact = state.contact_by_phone("p", "c", "5511999999999").unwrap();
+        assert_eq!(contact["id"], "5511999999999");
+        assert_eq!(contact["phone_number"], "5511999999999");
+        assert_eq!(contact["technical_id"], "200889293889773@lid");
+
+        let resolved = state.conversation("p", "c", "5511999999999").unwrap();
+        assert_eq!(resolved.id, "200889293889773@lid");
+        assert_eq!(resolved.display_name.as_deref(), Some("Tetoz"));
+
+        let messages = state
+            .list_messages_for_conversation("p", "c", "5511999999999", None, None, 10)
+            .unwrap();
+        assert_eq!(messages.messages.len(), 1);
+        assert_eq!(messages.conversation_id, "5511999999999");
+        assert_eq!(messages.messages[0].conversation_id, "5511999999999");
     }
 
     #[test]
@@ -7800,15 +9771,20 @@ mod tests {
         let members = state.group_members(group_id);
         let existing = members
             .iter()
-            .find(|member| member["contact_id"] == "5511888888888@s.whatsapp.net")
+            .find(|member| member["contact_id"] == "5511888888888")
             .unwrap();
+        assert_eq!(
+            existing["technical_contact_id"],
+            "5511888888888@s.whatsapp.net"
+        );
         assert_eq!(existing["display_name"], "Pessoa do Grupo");
         assert_eq!(existing["is_admin"], true);
         assert_eq!(existing["role"], "owner");
         let lid = members
             .iter()
-            .find(|member| member["contact_id"] == "200889293889773@lid")
+            .find(|member| member["contact_id"] == "5511999999999")
             .unwrap();
+        assert_eq!(lid["technical_contact_id"], "200889293889773@lid");
         assert_eq!(lid["display_name"], "+5511999999999");
     }
 
@@ -8012,8 +9988,10 @@ mod tests {
     #[test]
     fn inbound_image_gets_rustyzap_key_and_preview_url() {
         let mut config = AppConfig::from_env();
+        config.storage_provider = crate::config::StorageProvider::LocalFs;
         config.r2.bucket = "devbucket".to_string();
         config.r2.base_prefix = "rustyzap".to_string();
+        config.r2.public_url = Some("https://pub.example".to_string());
         let state = AppState::new(config);
         let (message, media, _) = state.receive_inbound_media(
             "p",
@@ -8052,6 +10030,57 @@ mod tests {
     }
 
     #[test]
+    fn list_messages_normalizes_local_media_urls() {
+        let mut config = AppConfig::from_env();
+        config.storage_provider = crate::config::StorageProvider::LocalFs;
+        config.r2.public_url = Some("https://pub.example".to_string());
+        let state = AppState::new(config);
+        let (message, _, _) = state.receive_inbound_media(
+            "p",
+            "c",
+            SimulateInboundMediaRequest {
+                conversation_id: Some("5511999999999@s.whatsapp.net".to_string()),
+                channel_id: Some("ch".to_string()),
+                from_phone_e164: Some("+5511999999999".to_string()),
+                sender_name: Some("Cliente RustZap".to_string()),
+                media_type: Some("image".to_string()),
+                mime_type: Some("image/jpeg".to_string()),
+                size_bytes: Some(8192),
+                filename: Some("foto.jpg".to_string()),
+                caption: None,
+                profile_picture_url: None,
+            },
+        );
+        {
+            let mut inner = state.inner.lock().expect("store lock poisoned");
+            let stored = inner.messages_by_id.get_mut(&message.id).unwrap();
+            stored.media_url = Some("https://pub.example/bad.jpg".to_string());
+            stored.thumbnail_url = Some("https://pub.example/bad.jpg".to_string());
+            let conversation_messages = inner
+                .messages_by_conversation
+                .get_mut(&message.conversation_id)
+                .unwrap();
+            let stored = conversation_messages
+                .iter_mut()
+                .find(|stored| stored.id == message.id)
+                .unwrap();
+            stored.media_url = Some("https://pub.example/bad.jpg".to_string());
+            stored.thumbnail_url = Some("https://pub.example/bad.jpg".to_string());
+        }
+
+        let page = state.list_messages(&message.conversation_id, None, None, 10);
+        let listed = page.messages.first().unwrap();
+        assert!(listed.media_url.as_deref().unwrap().contains("/dev-media/"));
+        assert!(
+            listed
+                .thumbnail_url
+                .as_deref()
+                .unwrap()
+                .contains("/dev-media/")
+        );
+    }
+
+    #[test]
     fn set_channel_status_clears_connected_at_when_disconnected() {
         let state = AppState::new(AppConfig::from_env());
         state.create_channel("p", "c", Some("ch".to_string()), None, None);
@@ -8062,6 +10091,23 @@ mod tests {
 
         assert_eq!(state.channel("ch")["status"], "disconnected");
         assert_eq!(state.channel_connected_at("ch"), None);
+    }
+
+    #[test]
+    fn qr_does_not_return_expired_pairing_secret() {
+        let state = AppState::new(AppConfig::from_env());
+        state.create_channel("p", "c", Some("ch".to_string()), None, None);
+        state.set_qr(
+            "ch",
+            "waiting_qr",
+            Some("expired-pairing-secret".to_string()),
+            OffsetDateTime::now_utc() - Duration::seconds(1),
+        );
+
+        let qr = state.qr("ch");
+
+        assert_eq!(qr.status, "disconnected");
+        assert_eq!(qr.qr_code_text, None);
     }
 
     #[test]
@@ -8099,6 +10145,7 @@ mod tests {
                 group_id: None,
                 display_name: Some("Status".to_string()),
                 display_phone: None,
+                phone_number: None,
                 avatar_url: None,
                 profile_picture_url: None,
                 last_seq: 1,

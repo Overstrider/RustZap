@@ -1,6 +1,12 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 use serde_json::Value;
 use time::OffsetDateTime;
+
+pub const INTERNAL_PROJECT_ID: &str = "rustzap_internal";
+
+pub fn internal_project_id() -> String {
+    INTERNAL_PROJECT_ID.to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
@@ -23,17 +29,20 @@ pub struct ReadyCheck {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectCompanyPath {
+    #[serde(default = "internal_project_id")]
     pub project_id: String,
     pub company_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectPath {
+    #[serde(default = "internal_project_id")]
     pub project_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectCompanyChannelPath {
+    #[serde(default = "internal_project_id")]
     pub project_id: String,
     pub company_id: String,
     pub channel_id: String,
@@ -41,6 +50,7 @@ pub struct ProjectCompanyChannelPath {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectCompanyConversationPath {
+    #[serde(default = "internal_project_id")]
     pub project_id: String,
     pub company_id: String,
     pub conversation_id: String,
@@ -48,6 +58,7 @@ pub struct ProjectCompanyConversationPath {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectCompanyMessagePath {
+    #[serde(default = "internal_project_id")]
     pub project_id: String,
     pub company_id: String,
     pub message_id: String,
@@ -55,6 +66,7 @@ pub struct ProjectCompanyMessagePath {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectCompanyMediaPath {
+    #[serde(default = "internal_project_id")]
     pub project_id: String,
     pub company_id: String,
     pub media_id: String,
@@ -62,6 +74,7 @@ pub struct ProjectCompanyMediaPath {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectCompanyContactPath {
+    #[serde(default = "internal_project_id")]
     pub project_id: String,
     pub company_id: String,
     pub contact_id: String,
@@ -69,6 +82,7 @@ pub struct ProjectCompanyContactPath {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectCompanyGroupPath {
+    #[serde(default = "internal_project_id")]
     pub project_id: String,
     pub company_id: String,
     pub group_id: String,
@@ -76,10 +90,36 @@ pub struct ProjectCompanyGroupPath {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectCompanyGroupMemberPath {
+    #[serde(default = "internal_project_id")]
     pub project_id: String,
     pub company_id: String,
     pub group_id: String,
     pub contact_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectCompanyContactPhonePath {
+    #[serde(default = "internal_project_id")]
+    pub project_id: String,
+    pub company_id: String,
+    pub phone_e164: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectCompanyGroupJoinRequestPath {
+    #[serde(default = "internal_project_id")]
+    pub project_id: String,
+    pub company_id: String,
+    pub group_id: String,
+    pub request_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProjectCompanyCallbackPath {
+    #[serde(default = "internal_project_id")]
+    pub project_id: String,
+    pub company_id: String,
+    pub callback_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -133,6 +173,8 @@ pub struct Conversation {
     pub group_id: Option<String>,
     pub display_name: Option<String>,
     pub display_phone: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phone_number: Option<String>,
     pub avatar_url: Option<String>,
     pub profile_picture_url: Option<String>,
     pub last_seq: i64,
@@ -149,7 +191,34 @@ pub struct Conversation {
     pub updated_at: OffsetDateTime,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryState {
+    NotApplicable,
+    Pending,
+    Sent,
+    Delivered,
+    Read,
+    Failed,
+}
+
+impl DeliveryState {
+    pub fn for_message(direction: &str, message_type: &str, status: &str) -> Self {
+        if !matches!(direction, "outbound" | "out") || message_type == "system" {
+            return Self::NotApplicable;
+        }
+        match status {
+            "queued" => Self::Pending,
+            "sent_to_whatsapp" | "server_ack" => Self::Sent,
+            "delivered" => Self::Delivered,
+            "read" | "played" => Self::Read,
+            "failed" => Self::Failed,
+            _ => Self::NotApplicable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Message {
     pub id: String,
     pub project_id: String,
@@ -182,6 +251,51 @@ pub struct Message {
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+}
+
+impl Message {
+    pub fn delivery_state(&self) -> DeliveryState {
+        DeliveryState::for_message(&self.direction, &self.message_type, &self.status)
+    }
+}
+
+impl Serialize for Message {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("Message", 29)?;
+        state.serialize_field("id", &self.id)?;
+        state.serialize_field("project_id", &self.project_id)?;
+        state.serialize_field("company_id", &self.company_id)?;
+        state.serialize_field("conversation_id", &self.conversation_id)?;
+        state.serialize_field("channel_account_id", &self.channel_account_id)?;
+        state.serialize_field("conversation_seq", &self.conversation_seq)?;
+        state.serialize_field("wa_message_id", &self.wa_message_id)?;
+        state.serialize_field("direction", &self.direction)?;
+        state.serialize_field("sender_contact_id", &self.sender_contact_id)?;
+        state.serialize_field("sender_display_name", &self.sender_display_name)?;
+        state.serialize_field("message_type", &self.message_type)?;
+        state.serialize_field("text", &self.text)?;
+        state.serialize_field("media_id", &self.media_id)?;
+        state.serialize_field("media_url", &self.media_url)?;
+        state.serialize_field("thumbnail_url", &self.thumbnail_url)?;
+        state.serialize_field("mime_type", &self.mime_type)?;
+        state.serialize_field("file_name", &self.file_name)?;
+        state.serialize_field("quoted_message_id", &self.quoted_message_id)?;
+        state.serialize_field("status", &self.status)?;
+        state.serialize_field("delivery_state", &self.delivery_state())?;
+        state.serialize_field("error_message", &self.error_message)?;
+        state.serialize_field("is_starred", &self.is_starred)?;
+        state.serialize_field("is_pinned", &self.is_pinned)?;
+        state.serialize_field("reaction", &self.reaction)?;
+        state.serialize_field("sent_by_source", &self.sent_by_source)?;
+        state.serialize_field("sent_by_external_user_id", &self.sent_by_external_user_id)?;
+        state.serialize_field("created_at_wa", &self.created_at_wa)?;
+        state.serialize_field("created_at", &self.created_at)?;
+        state.serialize_field("updated_at", &self.updated_at)?;
+        state.end()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -388,4 +502,49 @@ pub struct SubscribeRequest {
     pub project_id: String,
     pub company_id: String,
     pub topics: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DeliveryState;
+
+    #[test]
+    fn delivery_state_maps_public_message_states() {
+        assert_eq!(
+            DeliveryState::for_message("inbound", "text", "read"),
+            DeliveryState::NotApplicable
+        );
+        assert_eq!(
+            DeliveryState::for_message("outbound", "system", "read"),
+            DeliveryState::NotApplicable
+        );
+        assert_eq!(
+            DeliveryState::for_message("outbound", "text", "queued"),
+            DeliveryState::Pending
+        );
+        assert_eq!(
+            DeliveryState::for_message("outbound", "text", "sent_to_whatsapp"),
+            DeliveryState::Sent
+        );
+        assert_eq!(
+            DeliveryState::for_message("outbound", "text", "server_ack"),
+            DeliveryState::Sent
+        );
+        assert_eq!(
+            DeliveryState::for_message("outbound", "text", "delivered"),
+            DeliveryState::Delivered
+        );
+        assert_eq!(
+            DeliveryState::for_message("outbound", "text", "read"),
+            DeliveryState::Read
+        );
+        assert_eq!(
+            DeliveryState::for_message("outbound", "audio", "played"),
+            DeliveryState::Read
+        );
+        assert_eq!(
+            DeliveryState::for_message("outbound", "text", "failed"),
+            DeliveryState::Failed
+        );
+    }
 }

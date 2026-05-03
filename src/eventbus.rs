@@ -591,7 +591,7 @@ pub fn health_check(mode: EventBusMode, kafka: &KafkaConfig) -> EventBusHealth {
         },
         EventBusMode::Postgres => EventBusHealth {
             ok: true,
-            detail: "postgres event bus placeholder".to_string(),
+            detail: "postgres event bus drainer enabled".to_string(),
         },
         EventBusMode::Kafka => {
             if kafka
@@ -642,7 +642,7 @@ pub fn topic_for_event(kafka: &KafkaConfig, event_type: &str) -> String {
         "audio.transcription.requested" => "audio.transcription.requested",
         "audio.transcribed" | "transcript.completed" => "audio.transcribed",
         "conversation.dirty" => "conversation.dirty",
-        "conversation.read" => "conversation.event",
+        "conversation.read" | "conversation.updated" => "conversation.event",
         "message.receipt" => "delivery.receipt",
         "channel.connected" | "channel.disconnected" | "channel.qr" | "channel.logged_out" => {
             "channel.status"
