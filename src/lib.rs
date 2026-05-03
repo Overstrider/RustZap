@@ -16,3 +16,6 @@ pub mod workers;
 
 pub use routes::build_router;
 pub use state::AppState;
+
+#[cfg(test)]
+mod current_contract_tests;

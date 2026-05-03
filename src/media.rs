@@ -89,6 +89,7 @@ pub fn r2_object_key(input: R2ObjectKeyInput<'_>) -> String {
         .format(format_description!("[year]-[month]-[day]"))
         .expect("date format is valid");
     let ext = input.ext.trim_start_matches('.');
+    let channel_hash = opaque_id_hash(input.channel_id);
     match input.class {
         "permanent" => format!(
             "{}/permanent/project={}/company={}/entity={}/entity_id_hash={}/date={}/media={}.{}",
@@ -105,11 +106,11 @@ pub fn r2_object_key(input: R2ObjectKeyInput<'_>) -> String {
             ext
         ),
         "outbound-temp" => format!(
-            "{}/outbound-temp/project={}/company={}/channel={}/date={}/upload={}.{}",
+            "{}/outbound-temp/project={}/company={}/channel_hash={}/date={}/upload={}.{}",
             input.base_prefix,
             input.project_id,
             input.company_id,
-            input.channel_id,
+            channel_hash,
             date,
             input.media_id,
             ext
@@ -120,12 +121,12 @@ pub fn r2_object_key(input: R2ObjectKeyInput<'_>) -> String {
                 .map(conversation_hash)
                 .unwrap_or_else(|| "unknown".to_string());
             format!(
-                "{}/{}/project={}/company={}/channel={}/conversation_hash={}/date={}/media={}.{}",
+                "{}/{}/project={}/company={}/channel_hash={}/conversation_hash={}/date={}/media={}.{}",
                 input.base_prefix,
                 class,
                 input.project_id,
                 input.company_id,
-                input.channel_id,
+                channel_hash,
                 conversation_hash,
                 date,
                 input.media_id,
@@ -203,6 +204,27 @@ mod tests {
         assert!(key.contains("entity_id_hash="));
         assert!(!key.contains("+5511999999999"));
         assert!(!key.contains("5511999999999"));
+    }
+
+    #[test]
+    fn r2_key_hashes_channel_ids_so_caller_supplied_pii_is_not_persisted() {
+        let key = r2_object_key(R2ObjectKeyInput {
+            base_prefix: "rustzap",
+            class: "temp",
+            project_id: "tetoz",
+            company_id: "company_123",
+            channel_id: "5511999999999@s.whatsapp.net",
+            conversation_id: Some("conversation"),
+            entity_type: None,
+            entity_id: None,
+            date: date!(2026 - 04 - 26),
+            media_id: "media_123",
+            ext: ".jpg",
+        });
+
+        assert!(key.contains("channel_hash="));
+        assert!(!key.contains("5511999999999"));
+        assert!(!key.contains("s.whatsapp.net"));
     }
 
     #[test]

@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     io::Cursor,
+    net::IpAddr,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -1400,11 +1401,16 @@ impl AppState {
         id: Option<String>,
         label: Option<String>,
         phone_e164: Option<String>,
-    ) -> Value {
+    ) -> ApiResult<Value> {
         let channel_id = id.unwrap_or_else(|| format!("channel_{}", Uuid::now_v7().simple()));
         let now = OffsetDateTime::now_utc();
         let mut inner = self.inner.lock().expect("store lock poisoned");
         if let Some(existing) = inner.channels.get_mut(&channel_id) {
+            if !channel_belongs_to_company(existing, project_id, company_id) {
+                return Err(ApiError::Conflict(format!(
+                    "channel {channel_id} already exists for another company"
+                )));
+            }
             existing["project_id"] = json!(project_id);
             existing["company_id"] = json!(company_id);
             if let Some(label) = label {
@@ -1416,7 +1422,7 @@ impl AppState {
             existing["updated_at"] = json!(ts(now));
             let updated = existing.clone();
             self.persist_locked(&inner);
-            return updated;
+            return Ok(updated);
         }
         let channel = json!({
             "id": channel_id,
@@ -1432,7 +1438,7 @@ impl AppState {
         });
         inner.channels.insert(channel_id, channel.clone());
         self.persist_locked(&inner);
-        channel
+        Ok(channel)
     }
 
     pub async fn connect_channel(
@@ -1441,6 +1447,7 @@ impl AppState {
         company_id: &str,
         channel_id: &str,
     ) -> ApiResult<QrState> {
+        self.channel_for_company(project_id, company_id, channel_id)?;
         let already_connected = self
             .inner
             .lock()
@@ -1520,6 +1527,16 @@ impl AppState {
         channel
     }
 
+    pub fn disconnect_channel_for_company(
+        &self,
+        project_id: &str,
+        company_id: &str,
+        channel_id: &str,
+    ) -> ApiResult<Value> {
+        self.channel_for_company(project_id, company_id, channel_id)?;
+        Ok(self.disconnect_channel(channel_id))
+    }
+
     pub fn channel(&self, channel_id: &str) -> Value {
         self.reconcile_channel_runtime_status(channel_id);
         self.inner
@@ -1529,6 +1546,23 @@ impl AppState {
             .get(channel_id)
             .cloned()
             .unwrap_or_else(|| json!({"id": channel_id, "status": "disconnected"}))
+    }
+
+    pub fn channel_for_company(
+        &self,
+        project_id: &str,
+        company_id: &str,
+        channel_id: &str,
+    ) -> ApiResult<Value> {
+        self.reconcile_channel_runtime_status(channel_id);
+        self.inner
+            .lock()
+            .expect("store lock poisoned")
+            .channels
+            .get(channel_id)
+            .filter(|channel| channel_belongs_to_company(channel, project_id, company_id))
+            .cloned()
+            .ok_or_else(|| ApiError::NotFound(format!("channel {channel_id} not found")))
     }
 
     fn reconcile_channel_runtime_status(&self, channel_id: &str) {
@@ -1703,6 +1737,16 @@ impl AppState {
         }
     }
 
+    pub fn qr_for_company(
+        &self,
+        project_id: &str,
+        company_id: &str,
+        channel_id: &str,
+    ) -> ApiResult<QrState> {
+        self.channel_for_company(project_id, company_id, channel_id)?;
+        Ok(self.qr(channel_id))
+    }
+
     pub fn send_message(
         &self,
         project_id: &str,
@@ -1718,12 +1762,29 @@ impl AppState {
                 conversation_id,
                 idempotency_key,
                 request,
-                None,
             )?
             .message)
     }
 
     pub fn prepare_send_message(
+        &self,
+        project_id: &str,
+        company_id: &str,
+        conversation_id: &str,
+        idempotency_key: &str,
+        request: SendMessageRequest,
+    ) -> ApiResult<SendMessageOutcome> {
+        self.prepare_send_message_with_actor(
+            project_id,
+            company_id,
+            conversation_id,
+            idempotency_key,
+            request,
+            None,
+        )
+    }
+
+    pub fn prepare_send_message_with_actor(
         &self,
         project_id: &str,
         company_id: &str,
@@ -1997,7 +2058,8 @@ impl AppState {
         let public_url = object_key
             .as_deref()
             .and_then(|object_key| self.config.public_object_url(object_key));
-        let dev_preview_url = (media_type == "image").then(|| self.config.dev_media_url(&media_id));
+        let dev_preview_url = (self.config.dev_mode && media_type == "image")
+            .then(|| self.config.dev_media_url(&media_id));
         let thumbnail_url = if media_type == "image" {
             if self.config.r2.can_upload() {
                 public_url.clone().or(dev_preview_url)
@@ -2672,7 +2734,7 @@ impl AppState {
     }
 
     fn normalize_message_media_urls(&self, message: &mut Message) {
-        if self.config.storage_provider != StorageProvider::LocalFs {
+        if self.config.storage_provider != StorageProvider::LocalFs || !self.config.dev_mode {
             return;
         }
         let Some(media_id) = message.media_id.as_deref() else {
@@ -4408,7 +4470,7 @@ impl AppState {
             .object_key
             .as_deref()
             .and_then(|object_key| self.config.public_object_url(object_key));
-        let local_url = (input.storage_status != "rejected")
+        let local_url = (self.config.dev_mode && input.storage_status != "rejected")
             .then(|| self.config.dev_media_url(&input.media_id));
         let public_url = public_object_url.or(local_url);
         let thumbnail_url = (media_type == "image")
@@ -4638,9 +4700,12 @@ impl AppState {
             media_id: &media_id,
             ext,
         });
-        let dev_url = self.config.dev_media_url(&media_id);
-        let public_url = Some(dev_url.clone());
-        let thumbnail_url = (media_type == "image").then_some(dev_url);
+        let dev_url = self
+            .config
+            .dev_mode
+            .then(|| self.config.dev_media_url(&media_id));
+        let public_url = dev_url.clone();
+        let thumbnail_url = (media_type == "image").then(|| dev_url.clone()).flatten();
         let media = MediaObject {
             id: media_id.clone(),
             project_id: project_id.to_string(),
@@ -4866,9 +4931,9 @@ impl AppState {
                         .to_lowercase()
                         .contains(&needle)
             })
+            .take(limit)
             .collect();
         messages.sort_by_key(|message| message.conversation_seq);
-        messages.truncate(limit);
         messages
     }
 
@@ -4942,10 +5007,11 @@ impl AppState {
         media.permanent_object_key = Some(object_key.clone());
         media.public_url = self.config.public_object_url(&object_key);
         if media.media_type == "image" {
-            media.thumbnail_url = media
-                .public_url
-                .clone()
-                .or_else(|| Some(self.config.dev_media_url(media_id)));
+            media.thumbnail_url = media.public_url.clone().or_else(|| {
+                self.config
+                    .dev_mode
+                    .then(|| self.config.dev_media_url(media_id))
+            });
         }
         media.saved_at = Some(now);
         media.updated_at = now;
@@ -5824,11 +5890,25 @@ impl AppState {
             .unwrap_or_else(|| format!("callback_{}", Uuid::now_v7().simple()));
         let mut inner = self.inner.lock().expect("store lock poisoned");
         let existing = inner.callbacks.get(&callback_id).cloned();
+        if existing
+            .as_ref()
+            .is_some_and(|callback| !callback_belongs_to_company(callback, project_id, company_id))
+        {
+            return Err(ApiError::NotFound(format!(
+                "callback {callback_id} not found"
+            )));
+        }
         let created_at = existing
             .as_ref()
             .and_then(|value| value["created_at"].as_str())
             .map(str::to_string)
             .unwrap_or_else(|| ts(now));
+        let callback_url = body
+            .get("url")
+            .and_then(Value::as_str)
+            .or_else(|| existing.as_ref().and_then(|value| value["url"].as_str()))
+            .unwrap_or("http://localhost:3000/webhook");
+        validate_callback_url(callback_url, self.config.dev_mode)?;
         let encrypted_secret = if let Some(secret) = body.get("secret").and_then(Value::as_str) {
             Some(self.encrypt_callback_secret(secret)?)
         } else if let Some(existing_secret) = existing
@@ -5854,7 +5934,7 @@ impl AppState {
             "id": callback_id,
             "project_id": project_id,
             "company_id": company_id,
-            "url": body.get("url").and_then(Value::as_str).unwrap_or("http://localhost:3000/webhook"),
+            "url": callback_url,
             "encrypted_secret": encrypted_secret,
             "enabled": body.get("enabled").and_then(Value::as_bool).unwrap_or(true),
             "events": body.get("events").cloned().unwrap_or_else(|| json!(["conversation.dirty"])),
@@ -5949,8 +6029,18 @@ impl AppState {
         let mut inner = self.inner.lock().expect("store lock poisoned");
         let callback = inner
             .callbacks
-            .remove(callback_id)
+            .get(callback_id)
+            .cloned()
             .ok_or_else(|| ApiError::NotFound(format!("callback {callback_id} not found")))?;
+        if !callback_belongs_to_company(&callback, project_id, company_id) {
+            return Err(ApiError::NotFound(format!(
+                "callback {callback_id} not found"
+            )));
+        }
+        let callback = inner
+            .callbacks
+            .remove(callback_id)
+            .expect("callback existence checked before remove");
         self.persist_locked(&inner);
         drop(inner);
         self.audit_log(
@@ -6387,7 +6477,7 @@ impl AppState {
                     Some(channel_id.clone()),
                     Some("WhatsApp Restored".to_string()),
                     None,
-                );
+                )?;
             }
             if self
                 .connect_channel(&project_id, &company_id, &channel_id)
@@ -7892,6 +7982,70 @@ fn sanitize_callback(callback: &Value) -> Value {
     sanitized
 }
 
+fn callback_belongs_to_company(callback: &Value, project_id: &str, company_id: &str) -> bool {
+    callback.get("project_id").and_then(Value::as_str) == Some(project_id)
+        && callback.get("company_id").and_then(Value::as_str) == Some(company_id)
+}
+
+fn validate_callback_url(url: &str, dev_mode: bool) -> ApiResult<()> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|err| ApiError::BadRequest(format!("invalid callback url: {err}")))?;
+    match parsed.scheme() {
+        "https" => {}
+        "http" if dev_mode => {}
+        "http" => {
+            return Err(ApiError::BadRequest(
+                "callback url must use https outside dev mode".to_string(),
+            ));
+        }
+        _ => {
+            return Err(ApiError::BadRequest(
+                "callback url scheme must be https".to_string(),
+            ));
+        }
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| ApiError::BadRequest("callback url must include a host".to_string()))?;
+    if callback_host_is_localhost(host) && !dev_mode {
+        return Err(ApiError::BadRequest(
+            "callback url host is not allowed outside dev mode".to_string(),
+        ));
+    }
+    if let Ok(ip) = host.parse::<IpAddr>()
+        && callback_ip_is_disallowed(ip, dev_mode)
+    {
+        return Err(ApiError::BadRequest(
+            "callback url host is not allowed outside dev mode".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn callback_host_is_localhost(host: &str) -> bool {
+    let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+    normalized == "localhost" || normalized.ends_with(".localhost")
+}
+
+fn callback_ip_is_disallowed(ip: IpAddr, dev_mode: bool) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_unspecified()
+                || ip.is_broadcast()
+                || ip.is_multicast()
+                || (!dev_mode && (ip.is_loopback() || ip.is_private() || ip.is_link_local()))
+        }
+        IpAddr::V6(ip) => {
+            let first_segment = ip.segments()[0];
+            let unique_local = (first_segment & 0xfe00) == 0xfc00;
+            let link_local = (first_segment & 0xffc0) == 0xfe80;
+            ip.is_unspecified()
+                || ip.is_multicast()
+                || (!dev_mode && (ip.is_loopback() || unique_local || link_local))
+        }
+    }
+}
+
 fn callback_subscribes_to_event(callback: &Value, event_type: &str) -> bool {
     callback
         .get("events")
@@ -8017,7 +8171,7 @@ mod tests {
         };
 
         let outcome = state
-            .prepare_send_message("p", "c", "conv", "idem-async", req, None)
+            .prepare_send_message("p", "c", "conv", "idem-async", req)
             .unwrap();
 
         assert!(outcome.should_dispatch);
@@ -8067,7 +8221,7 @@ mod tests {
         };
 
         let outcome = state
-            .prepare_send_message("p", "c", "conv_worker", "idem-worker", req, None)
+            .prepare_send_message("p", "c", "conv_worker", "idem-worker", req)
             .unwrap();
         let event = state
             .events()
@@ -8116,7 +8270,6 @@ mod tests {
                     quoted_message_id: None,
                     metadata: None,
                 },
-                None,
             )
             .unwrap();
 
@@ -8166,7 +8319,6 @@ mod tests {
                     quoted_message_id: None,
                     metadata: None,
                 },
-                None,
             )
             .unwrap();
         let event = state
@@ -8442,7 +8594,6 @@ mod tests {
                     quoted_message_id: None,
                     metadata: None,
                 },
-                None,
             )
             .unwrap();
 
@@ -8906,7 +9057,6 @@ mod tests {
                     quoted_message_id: None,
                     metadata: None,
                 },
-                None,
             )
             .unwrap();
 
@@ -9298,7 +9448,9 @@ mod tests {
     #[tokio::test]
     async fn dispatch_fails_fast_when_channel_not_connected() {
         let state = AppState::new(AppConfig::from_env());
-        state.create_channel("p", "c", Some("ch".to_string()), None, None);
+        state
+            .create_channel("p", "c", Some("ch".to_string()), None, None)
+            .unwrap();
         state.set_channel_status("ch", "waiting_qr", None);
         state.receive_inbound_text(
             "p",
@@ -9328,7 +9480,6 @@ mod tests {
                 "5511999999999@s.whatsapp.net",
                 "send-fast-fail",
                 request,
-                None,
             )
             .unwrap();
 
@@ -9351,7 +9502,9 @@ mod tests {
     #[tokio::test]
     async fn dispatch_marks_stale_connected_channel_disconnected() {
         let state = AppState::new(AppConfig::from_env());
-        state.create_channel("p", "c", Some("ch".to_string()), None, None);
+        state
+            .create_channel("p", "c", Some("ch".to_string()), None, None)
+            .unwrap();
         let connected_at = OffsetDateTime::now_utc();
         state.set_channel_status("ch", "connected", Some(connected_at));
         state.receive_inbound_text(
@@ -9382,7 +9535,6 @@ mod tests {
                 "5511999999999@s.whatsapp.net",
                 "send-stale-channel",
                 request,
-                None,
             )
             .unwrap();
 
@@ -9407,7 +9559,9 @@ mod tests {
     #[test]
     fn channel_status_reports_disconnected_when_runtime_is_gone() {
         let state = AppState::new(AppConfig::from_env());
-        state.create_channel("p", "c", Some("ch".to_string()), None, None);
+        state
+            .create_channel("p", "c", Some("ch".to_string()), None, None)
+            .unwrap();
         let connected_at = OffsetDateTime::now_utc();
         state.set_channel_status("ch", "connected", Some(connected_at));
 
@@ -9424,7 +9578,9 @@ mod tests {
     #[test]
     fn qr_status_reports_disconnected_when_runtime_is_gone() {
         let state = AppState::new(AppConfig::from_env());
-        state.create_channel("p", "c", Some("ch".to_string()), None, None);
+        state
+            .create_channel("p", "c", Some("ch".to_string()), None, None)
+            .unwrap();
         let connected_at = OffsetDateTime::now_utc();
         state.set_channel_status("ch", "connected", Some(connected_at));
 
@@ -10083,7 +10239,9 @@ mod tests {
     #[test]
     fn set_channel_status_clears_connected_at_when_disconnected() {
         let state = AppState::new(AppConfig::from_env());
-        state.create_channel("p", "c", Some("ch".to_string()), None, None);
+        state
+            .create_channel("p", "c", Some("ch".to_string()), None, None)
+            .unwrap();
         let connected_at = OffsetDateTime::now_utc();
         state.set_channel_status("ch", "connected", Some(connected_at));
 
@@ -10096,7 +10254,9 @@ mod tests {
     #[test]
     fn qr_does_not_return_expired_pairing_secret() {
         let state = AppState::new(AppConfig::from_env());
-        state.create_channel("p", "c", Some("ch".to_string()), None, None);
+        state
+            .create_channel("p", "c", Some("ch".to_string()), None, None)
+            .unwrap();
         state.set_qr(
             "ch",
             "waiting_qr",
@@ -10225,7 +10385,9 @@ mod tests {
     #[tokio::test]
     async fn whatsapp_message_before_connected_at_is_ignored() {
         let state = AppState::new(AppConfig::from_env());
-        state.create_channel("p", "c", Some("ch".to_string()), None, None);
+        state
+            .create_channel("p", "c", Some("ch".to_string()), None, None)
+            .unwrap();
         let connected_at = OffsetDateTime::now_utc();
         state.set_channel_status("ch", "connected", Some(connected_at));
 

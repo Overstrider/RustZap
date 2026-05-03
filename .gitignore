@@ -29,12 +29,13 @@ dev-tester/examples/__pycache__/
 dev-tester/examples/.env
 dev-tester/examples/.env.local
 
-# Local codedungeon/Codex runtime artifacts
-.codedungeon/codedungeon.db
-.codedungeon/plan/
-.codedungeon/state/
-.codex/bin/
+# Local agent/runtime artifacts
+.agents/skills/
+.codedungeon/
+.codex/
+.runtime/
 codedungeon/
+oom
 
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can

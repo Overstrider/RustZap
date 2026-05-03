@@ -38,6 +38,8 @@ use crate::{
     whatsapp,
 };
 
+const MAX_SEARCH_WINDOW: usize = 5_000;
+
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -1154,6 +1156,19 @@ fn page_offset(query: &PageQuery) -> ApiResult<usize> {
         .map(|offset| offset.unwrap_or_default())
 }
 
+fn bounded_search_limit(query: &PageQuery) -> ApiResult<usize> {
+    let offset = page_offset(query)?;
+    if offset >= MAX_SEARCH_WINDOW {
+        return Err(ApiError::BadRequest(format!(
+            "cursor must be below {MAX_SEARCH_WINDOW} for search"
+        )));
+    }
+    Ok(offset
+        .saturating_add(query.limit())
+        .saturating_add(1)
+        .min(MAX_SEARCH_WINDOW))
+}
+
 async fn debug_kafka(headers: HeaderMap, State(state): State<AppState>) -> ApiResult<Json<Value>> {
     authorize(&state.config, &headers, "admin:*")?;
     let sample = eventbus::dirty_signal(
@@ -1247,6 +1262,14 @@ async fn dev_media_preview(
     Path(media_id): Path<String>,
     State(state): State<AppState>,
 ) -> Response {
+    if !state.config.dev_mode {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "dev media preview disabled",
+        )
+            .into_response();
+    }
     match state.media(&media_id) {
         Ok(media) => {
             let message = media
@@ -1355,7 +1378,7 @@ async fn create_channel_account(
         req.id,
         req.label,
         req.phone_e164,
-    )))
+    )?))
 }
 
 async fn connect_channel(
@@ -1389,7 +1412,11 @@ async fn disconnect_channel(
         &path.project_id,
         &path.company_id,
     )?;
-    Ok(Json(state.disconnect_channel(&path.channel_id)))
+    Ok(Json(state.disconnect_channel_for_company(
+        &path.project_id,
+        &path.company_id,
+        &path.channel_id,
+    )?))
 }
 
 async fn get_channel(
@@ -1404,7 +1431,11 @@ async fn get_channel(
         &path.project_id,
         &path.company_id,
     )?;
-    Ok(Json(state.channel(&path.channel_id)))
+    Ok(Json(state.channel_for_company(
+        &path.project_id,
+        &path.company_id,
+        &path.channel_id,
+    )?))
 }
 
 async fn get_qr(
@@ -1419,7 +1450,11 @@ async fn get_qr(
         &path.project_id,
         &path.company_id,
     )?;
-    Ok(Json(json!(state.qr(&path.channel_id))))
+    Ok(Json(json!(state.qr_for_company(
+        &path.project_id,
+        &path.company_id,
+        &path.channel_id,
+    )?)))
 }
 
 async fn pair_code(
@@ -1668,7 +1703,7 @@ async fn send_message(
     })?;
     let idempotency_key = idempotency_key(&headers)?;
     let actor_id = actor_id(&headers);
-    let outcome = state.prepare_send_message(
+    let outcome = state.prepare_send_message_with_actor(
         &path.project_id,
         &path.company_id,
         &path.conversation_id,
@@ -1709,12 +1744,13 @@ async fn search_messages(
         &path.company_id,
     )?;
     let needle = query.q.clone().unwrap_or_default();
+    let search_limit = bounded_search_limit(&query)?;
     let items = state.search_messages_for_project_conversation(
         &path.project_id,
         &path.company_id,
         &path.conversation_id,
         &needle,
-        usize::MAX,
+        search_limit,
     )?;
     Ok(Json(paginated_items(items, &query)?))
 }
@@ -2147,14 +2183,18 @@ async fn download_url(
             .and_then(|object_key| state.config.public_object_url(object_key))
     })
     .or_else(|| {
-        media
-            .object_key
-            .as_ref()
-            .map(|_| state.config.dev_media_url(&media.id))
+        (state.config.dev_mode && media.object_key.is_some())
+            .then(|| state.config.dev_media_url(&media.id))
     })
     .or(media.public_url.clone())
     .or(media.thumbnail_url.clone())
-    .unwrap_or_else(|| state.config.dev_media_url(&media.id));
+    .or_else(|| {
+        state
+            .config
+            .dev_mode
+            .then(|| state.config.dev_media_url(&media.id))
+    })
+    .ok_or_else(|| ApiError::NotSupported("download URL is not available".to_string()))?;
     Ok(Json(
         json!({"media_id": path.media_id, "url": url, "ttl_seconds": state.config.r2_presigned_url_ttl_seconds}),
     ))
@@ -2405,13 +2445,14 @@ async fn group_search(
         &path.company_id,
     )?;
     let needle = query.q.clone().unwrap_or_default();
+    let search_limit = bounded_search_limit(&query)?;
     Ok(Json(paginated_items(
         state.search_messages_for_group(
             &path.project_id,
             &path.company_id,
             &path.group_id,
             &needle,
-            usize::MAX,
+            search_limit,
         )?,
         &query,
     )?))
@@ -3645,6 +3686,254 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let parsed: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["error"]["code"], "bad_request");
+    }
+
+    #[tokio::test]
+    async fn search_routes_reject_cursor_outside_bounded_window() {
+        let state = AppState::new(crate::config::AppConfig::from_env());
+        state.receive_inbound_text(
+            "rustzap_internal",
+            "company_search",
+            SimulateInboundTextRequest {
+                conversation_id: Some("conv_search".to_string()),
+                channel_id: Some("ch".to_string()),
+                from_phone_e164: None,
+                sender_name: None,
+                profile_picture_url: None,
+                text: "needle".to_string(),
+            },
+        );
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/companies/company_search/conversations/conv_search/search?q=needle&cursor=5000")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn channel_routes_do_not_cross_company_boundaries() {
+        let app = build_router(AppState::new(crate::config::AppConfig::from_env()));
+
+        let create_a = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/companies/company_a/channels/whatsapp/accounts")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"id":"shared_channel","label":"A"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_a.status(), StatusCode::OK);
+
+        let read_b = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/companies/company_b/channels/whatsapp/accounts/shared_channel")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_b.status(), StatusCode::NOT_FOUND);
+
+        let create_b_same_id = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/companies/company_b/channels/whatsapp/accounts")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"id":"shared_channel","label":"B"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_b_same_id.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn callback_routes_do_not_cross_company_boundaries() {
+        let app = build_router(AppState::new(crate::config::AppConfig::from_env()));
+
+        let create_a = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/v1/companies/company_a/consumer-callbacks/shared_callback")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"url":"https://hooks.example.test/rustzap","enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_a.status(), StatusCode::OK);
+
+        let update_b = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/v1/companies/company_b/consumer-callbacks/shared_callback")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"url":"https://evil.example.test/rustzap","enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(update_b.status(), StatusCode::NOT_FOUND);
+
+        let delete_b = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v1/companies/company_b/consumer-callbacks/shared_callback")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(delete_b.status(), StatusCode::NOT_FOUND);
+
+        let list_a = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/companies/company_a/consumer-callbacks")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_a.status(), StatusCode::OK);
+        let body = to_bytes(list_a.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["items"][0]["id"], "shared_callback");
+        assert_eq!(
+            parsed["items"][0]["url"],
+            "https://hooks.example.test/rustzap"
+        );
+    }
+
+    #[tokio::test]
+    async fn dev_media_preview_is_disabled_outside_dev_mode() {
+        let mut config = crate::config::AppConfig::from_env();
+        config.dev_mode = false;
+        let state = AppState::new(config);
+        let (_message, media, _transcript) = state
+            .try_receive_inbound_media(
+                crate::models::INTERNAL_PROJECT_ID,
+                "company_media",
+                SimulateInboundMediaRequest {
+                    conversation_id: Some("conv_media".to_string()),
+                    channel_id: Some("channel_media".to_string()),
+                    from_phone_e164: None,
+                    sender_name: None,
+                    profile_picture_url: None,
+                    media_type: Some("image".to_string()),
+                    mime_type: Some("image/png".to_string()),
+                    size_bytes: Some(512),
+                    caption: None,
+                    filename: Some("preview.png".to_string()),
+                },
+            )
+            .unwrap();
+        let app = build_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/dev-media/{}", media.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn production_callbacks_reject_loopback_webhook_urls() {
+        let mut config = crate::config::AppConfig::from_env();
+        config.dev_mode = false;
+        let app = build_router(AppState::new(config));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/companies/company_callback/consumer-callbacks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"url":"http://127.0.0.1:8080/internal","enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn production_callbacks_keep_existing_url_when_patch_omits_url() {
+        let mut config = crate::config::AppConfig::from_env();
+        config.dev_mode = false;
+        let app = build_router(AppState::new(config));
+
+        let create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/v1/companies/company_callback/consumer-callbacks/callback_https")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"url":"https://hooks.example.test/rustzap","enabled":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create.status(), StatusCode::OK);
+
+        let update = app
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/v1/companies/company_callback/consumer-callbacks/callback_https")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"enabled":false}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(update.status(), StatusCode::OK);
+        let body = to_bytes(update.into_body(), usize::MAX).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["url"], "https://hooks.example.test/rustzap");
+        assert_eq!(parsed["enabled"], false);
     }
 
     #[tokio::test]
