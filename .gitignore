@@ -32,7 +32,8 @@ dev-tester/examples/.env.local
 # Local agent/runtime artifacts
 .agents/skills/
 .codedungeon/
-.codex/
+.codex/bin/
+.codex/agents/cd_*.toml
 .runtime/
 codedungeon/
 oom
