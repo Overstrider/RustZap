@@ -3442,7 +3442,7 @@ impl AppState {
         });
         let metadata_members_count = profile.size;
         let profile_picture_provider_id = profile.profile_picture_id.clone();
-        let profile_picture_media_id =
+        let refreshed_profile_picture_media_id =
             rustzap_profile_picture_media_id(profile.profile_picture_media_id.as_deref());
         let profile_picture_url = profile.profile_picture_url.clone();
         let participants = profile.participants;
@@ -3472,7 +3472,11 @@ impl AppState {
             record.created_at_wa = created_at_wa;
             record.members_count = Some(members_count);
             record.admins_count = Some(admins_count);
-            record.profile_picture_media_id = profile_picture_media_id.clone();
+            let existing_profile_picture_media_id =
+                rustzap_profile_picture_media_id(record.profile_picture_media_id.as_deref());
+            record.profile_picture_media_id = refreshed_profile_picture_media_id
+                .clone()
+                .or(existing_profile_picture_media_id);
             record.avatar_url = profile_picture_url.clone();
             record.profile_picture_url = profile_picture_url.clone();
             record.clone()
@@ -3536,7 +3540,7 @@ impl AppState {
                     "subject_owner_jid": record_snapshot.subject_owner_jid,
                     "created_at_wa": record_snapshot.created_at_wa.map(ts),
                     "profile_picture_provider_id": profile_picture_provider_id,
-                    "profile_picture_media_id": profile_picture_media_id,
+                    "profile_picture_media_id": record_snapshot.profile_picture_media_id,
                     "profile_picture_url": record_snapshot.profile_picture_url,
                     "members_count": members_count,
                     "admins_count": admins_count
@@ -7383,8 +7387,11 @@ fn enrich_contact_inner(
             entry.profile_picture_url = Some(profile_picture_url);
         }
         if input.profile.profile_picture_media_id.is_some() {
+            let existing_profile_picture_media_id =
+                rustzap_profile_picture_media_id(entry.profile_picture_media_id.as_deref());
             entry.profile_picture_media_id =
-                rustzap_profile_picture_media_id(input.profile.profile_picture_media_id.as_deref());
+                rustzap_profile_picture_media_id(input.profile.profile_picture_media_id.as_deref())
+                    .or(existing_profile_picture_media_id);
         }
         if let Some(description) = input
             .profile
@@ -10419,6 +10426,80 @@ mod tests {
         assert!(group_conversation.profile_picture_media_id.is_none());
         let group = state.group("p", "c", group_id).unwrap();
         assert!(group["profile_picture_media_id"].is_null());
+    }
+
+    #[test]
+    fn group_profile_refresh_preserves_existing_media_id_without_new_media() {
+        let state = AppState::new(AppConfig::from_env());
+        let group_id = "120363000000000000@g.us";
+        let media_id = "media_018f6a3b2c4d7e8091a2b3c4d5e6f705";
+        state.apply_group_profile(
+            "p",
+            "c",
+            "ch",
+            group_id,
+            GroupProfile {
+                group_jid: group_id.to_string(),
+                subject: Some("Equipe RustZap".to_string()),
+                description: None,
+                owner_jid: None,
+                subject_owner_jid: None,
+                created_at_wa_unix: None,
+                size: Some(0),
+                profile_picture_id: Some("pic_group".to_string()),
+                profile_picture_media_id: Some(media_id.to_string()),
+                profile_picture_url: Some("https://example.test/group.jpg".to_string()),
+                participants: vec![],
+            },
+        );
+
+        state.apply_group_profile(
+            "p",
+            "c",
+            "ch",
+            group_id,
+            GroupProfile {
+                group_jid: group_id.to_string(),
+                subject: Some("Equipe RustZap".to_string()),
+                description: None,
+                owner_jid: None,
+                subject_owner_jid: None,
+                created_at_wa_unix: None,
+                size: Some(0),
+                profile_picture_id: Some("pic_group_refresh".to_string()),
+                profile_picture_media_id: Some("pic_group_refresh".to_string()),
+                profile_picture_url: Some("https://example.test/group-refresh.jpg".to_string()),
+                participants: vec![],
+            },
+        );
+
+        state.apply_group_profile(
+            "p",
+            "c",
+            "ch",
+            group_id,
+            GroupProfile {
+                group_jid: group_id.to_string(),
+                subject: Some("Equipe RustZap".to_string()),
+                description: None,
+                owner_jid: None,
+                subject_owner_jid: None,
+                created_at_wa_unix: None,
+                size: Some(0),
+                profile_picture_id: None,
+                profile_picture_media_id: None,
+                profile_picture_url: None,
+                participants: vec![],
+            },
+        );
+
+        let group_conversation = state.conversation("p", "c", group_id).unwrap();
+        assert_eq!(
+            group_conversation.profile_picture_media_id.as_deref(),
+            Some(media_id)
+        );
+        let group = state.group("p", "c", group_id).unwrap();
+        assert_eq!(group["profile_picture_media_id"], media_id);
     }
 
     #[test]
