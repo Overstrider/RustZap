@@ -25,7 +25,10 @@ use crate::{
     db::{KafkaDeadLetterRecord, MetadataDb, OutboxRecord},
     error::{ApiError, ApiResult},
     eventbus::{EventBusHandle, dirty_signal, new_event},
-    media::{MediaDecision, MediaLimits, R2ObjectKeyInput, magic_matches_mime, r2_object_key},
+    media::{
+        MediaDecision, MediaLimits, R2ObjectKeyInput, magic_matches_mime, r2_object_key,
+        sniff_mime_from_magic,
+    },
     models::{
         DirtyAckRequest, DirtyConversationItem, MediaObject, Message, MessagesPage, QrState,
         SendMessageRequest, SimulateInboundMediaRequest, SimulateInboundTextRequest, Transcript,
@@ -546,6 +549,7 @@ fn ensure_media_conversation_placeholders(store: &mut PersistedStore) {
                 } else {
                     phone_number_from_jid(&conversation_id)
                 },
+                profile_picture_media_id: None,
                 avatar_url: None,
                 profile_picture_url: None,
                 last_seq: 0,
@@ -2886,6 +2890,15 @@ impl AppState {
                 .as_ref()
                 .and_then(|contact| contact.profile_picture_url.clone())
         };
+        let profile_picture_media_id = if is_group {
+            group_record
+                .as_ref()
+                .and_then(|group| group.profile_picture_media_id.clone())
+        } else {
+            contact
+                .as_ref()
+                .and_then(|contact| contact.profile_picture_media_id.clone())
+        };
         let conversation = inner
             .conversations
             .entry(input.conversation_id.clone())
@@ -2904,6 +2917,7 @@ impl AppState {
                 display_name: display_name.clone(),
                 display_phone: display_phone.clone(),
                 phone_number: display_phone.as_deref().and_then(phone_number_from_e164),
+                profile_picture_media_id: profile_picture_media_id.clone(),
                 avatar_url: avatar_url.clone(),
                 profile_picture_url: profile_picture_url.clone(),
                 last_seq: 0,
@@ -2936,6 +2950,9 @@ impl AppState {
             }
             if profile_picture_url.is_some() {
                 conversation.profile_picture_url = profile_picture_url;
+            }
+            if profile_picture_media_id.is_some() {
+                conversation.profile_picture_media_id = profile_picture_media_id;
             }
         }
         conversation.last_seq += 1;
@@ -3134,7 +3151,27 @@ impl AppState {
                 .await
             {
                 Ok(profile) => {
-                    let profile = merge_contact_profile_alt(profile, alt_jid.as_deref());
+                    let mut profile = merge_contact_profile_alt(profile, alt_jid.as_deref());
+                    let profile_picture_url = profile.profile_picture_url.clone();
+                    if let Err(err) = state
+                        .attach_profile_picture_media_id(
+                            &project_id,
+                            &company_id,
+                            &channel_id,
+                            "contact_profile_picture",
+                            &contact_id,
+                            &mut profile.profile_picture_media_id,
+                            profile_picture_url.as_deref(),
+                        )
+                        .await
+                    {
+                        tracing::debug!(
+                            %channel_id,
+                            entity_type = "contact_profile_picture",
+                            error = %err,
+                            "profile picture media storage failed"
+                        );
+                    }
                     state.apply_contact_profile(ContactProfileApplyInput {
                         project_id: &project_id,
                         company_id: &company_id,
@@ -3183,7 +3220,27 @@ impl AppState {
         let channel_id = runtime.channel_id.clone();
         tokio::spawn(async move {
             match state.whatsapp.group_profile(&channel_id, &group_id).await {
-                Ok(profile) => {
+                Ok(mut profile) => {
+                    let profile_picture_url = profile.profile_picture_url.clone();
+                    if let Err(err) = state
+                        .attach_profile_picture_media_id(
+                            &project_id,
+                            &company_id,
+                            &channel_id,
+                            "group_profile_picture",
+                            &group_id,
+                            &mut profile.profile_picture_media_id,
+                            profile_picture_url.as_deref(),
+                        )
+                        .await
+                    {
+                        tracing::debug!(
+                            %channel_id,
+                            entity_type = "group_profile_picture",
+                            error = %err,
+                            "profile picture media storage failed"
+                        );
+                    }
                     state.apply_group_profile(
                         &project_id,
                         &company_id,
@@ -3384,7 +3441,8 @@ impl AppState {
                 .and_then(|timestamp| OffsetDateTime::from_unix_timestamp(timestamp).ok())
         });
         let metadata_members_count = profile.size;
-        let profile_picture_id = profile.profile_picture_id.clone();
+        let profile_picture_provider_id = profile.profile_picture_id.clone();
+        let profile_picture_media_id = profile.profile_picture_media_id.clone();
         let profile_picture_url = profile.profile_picture_url.clone();
         let participants = profile.participants;
         let members_count = metadata_members_count
@@ -3413,7 +3471,7 @@ impl AppState {
             record.created_at_wa = created_at_wa;
             record.members_count = Some(members_count);
             record.admins_count = Some(admins_count);
-            record.profile_picture_media_id = profile_picture_id.clone();
+            record.profile_picture_media_id = profile_picture_media_id.clone();
             record.avatar_url = profile_picture_url.clone();
             record.profile_picture_url = profile_picture_url.clone();
             record.clone()
@@ -3476,7 +3534,8 @@ impl AppState {
                     "owner_jid": record_snapshot.owner_jid,
                     "subject_owner_jid": record_snapshot.subject_owner_jid,
                     "created_at_wa": record_snapshot.created_at_wa.map(ts),
-                    "profile_picture_id": profile_picture_id,
+                    "profile_picture_provider_id": profile_picture_provider_id,
+                    "profile_picture_media_id": profile_picture_media_id,
                     "profile_picture_url": record_snapshot.profile_picture_url,
                     "members_count": members_count,
                     "admins_count": admins_count
@@ -3667,7 +3726,29 @@ impl AppState {
         {
             match self.whatsapp.contact_profile(channel_id, contact_id).await {
                 Ok(profile) => {
-                    let profile = merge_contact_profile_alt(profile, context.alt_jid.as_deref());
+                    let mut profile =
+                        merge_contact_profile_alt(profile, context.alt_jid.as_deref());
+                    let profile_picture_url = profile.profile_picture_url.clone();
+                    if let Some(channel_id) = context.channel_id.as_deref()
+                        && let Err(err) = self
+                            .attach_profile_picture_media_id(
+                                project_id,
+                                company_id,
+                                channel_id,
+                                "contact_profile_picture",
+                                contact_id,
+                                &mut profile.profile_picture_media_id,
+                                profile_picture_url.as_deref(),
+                            )
+                            .await
+                    {
+                        tracing::debug!(
+                            %channel_id,
+                            entity_type = "contact_profile_picture",
+                            error = %err,
+                            "profile picture media storage failed"
+                        );
+                    }
                     self.apply_contact_profile(ContactProfileApplyInput {
                         project_id,
                         company_id,
@@ -3841,7 +3922,27 @@ impl AppState {
             && self.channel_status(channel_id).as_deref() == Some("connected")
         {
             match self.whatsapp.group_profile(channel_id, group_id).await {
-                Ok(profile) => {
+                Ok(mut profile) => {
+                    let profile_picture_url = profile.profile_picture_url.clone();
+                    if let Err(err) = self
+                        .attach_profile_picture_media_id(
+                            project_id,
+                            company_id,
+                            channel_id,
+                            "group_profile_picture",
+                            group_id,
+                            &mut profile.profile_picture_media_id,
+                            profile_picture_url.as_deref(),
+                        )
+                        .await
+                    {
+                        tracing::debug!(
+                            %channel_id,
+                            entity_type = "group_profile_picture",
+                            error = %err,
+                            "profile picture media storage failed"
+                        );
+                    }
                     self.apply_group_profile(project_id, company_id, channel_id, group_id, profile);
                 }
                 Err(err) => {
@@ -4586,6 +4687,161 @@ impl AppState {
             }
             Err(err) => Err(ApiError::ProviderError(err)),
         }
+    }
+
+    async fn attach_profile_picture_media_id(
+        &self,
+        project_id: &str,
+        company_id: &str,
+        channel_id: &str,
+        entity_type: &str,
+        entity_id: &str,
+        target: &mut Option<String>,
+        profile_picture_url: Option<&str>,
+    ) -> ApiResult<()> {
+        if target.is_some() {
+            return Ok(());
+        }
+        let Some(url) = profile_picture_url
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            return Ok(());
+        };
+        let url = reqwest::Url::parse(url)
+            .map_err(|_| ApiError::BadRequest("profile picture URL is invalid".to_string()))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(ApiError::BadRequest(
+                "profile picture URL must use http or https".to_string(),
+            ));
+        }
+        let client = reqwest::Client::builder()
+            .timeout(StdDuration::from_secs(8))
+            .build()
+            .map_err(|_| ApiError::ProviderError("profile picture download failed".to_string()))?;
+        let response =
+            client.get(url).send().await.map_err(|_| {
+                ApiError::ProviderError("profile picture download failed".to_string())
+            })?;
+        if !response.status().is_success() {
+            return Err(ApiError::ProviderError(format!(
+                "profile picture download returned HTTP {}",
+                response.status().as_u16()
+            )));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|_| ApiError::ProviderError("profile picture download failed".to_string()))?
+            .to_vec();
+        let media = self.store_profile_picture_media_bytes(
+            project_id,
+            company_id,
+            channel_id,
+            entity_type,
+            entity_id,
+            bytes,
+        )?;
+        *target = Some(media.id);
+        Ok(())
+    }
+
+    fn store_profile_picture_media_bytes(
+        &self,
+        project_id: &str,
+        company_id: &str,
+        channel_id: &str,
+        entity_type: &str,
+        entity_id: &str,
+        bytes: Vec<u8>,
+    ) -> ApiResult<MediaObject> {
+        if bytes.is_empty() {
+            return Err(ApiError::BadRequest(
+                "profile picture image is empty".to_string(),
+            ));
+        }
+        let mime_type = sniff_profile_picture_mime(&bytes)?;
+        let media_id = format!("media_{}", Uuid::now_v7().simple());
+        let now = OffsetDateTime::now_utc();
+        let object_key = r2_object_key(R2ObjectKeyInput {
+            base_prefix: &self.config.r2.base_prefix,
+            class: "permanent",
+            project_id,
+            company_id,
+            channel_id,
+            conversation_id: None,
+            entity_type: Some(entity_type),
+            entity_id: Some(entity_id),
+            date: now.date(),
+            media_id: &media_id,
+            ext: extension_for_mime(mime_type),
+        });
+        if let Err(err) = self
+            .media_bytes
+            .put_blocking(&object_key, mime_type, bytes.clone())
+        {
+            let _ = self.media_bytes.delete_blocking(&object_key);
+            return Err(ApiError::ProviderError(format!(
+                "profile picture storage failed: {err}"
+            )));
+        }
+        let dev_url = self
+            .config
+            .dev_mode
+            .then(|| self.config.dev_media_url(&media_id));
+        let public_url = self
+            .config
+            .public_object_url(&object_key)
+            .or(dev_url.clone());
+        let media = MediaObject {
+            id: media_id.clone(),
+            project_id: project_id.to_string(),
+            company_id: company_id.to_string(),
+            conversation_id: entity_id.to_string(),
+            message_id: None,
+            media_type: "image".to_string(),
+            mime_type: mime_type.to_string(),
+            original_filename: None,
+            size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            sha256: hex::encode(Sha256::digest(&bytes)),
+            storage_status: "permanent".to_string(),
+            bucket: Some(self.media_bucket_name()),
+            object_key: Some(object_key.clone()),
+            permanent_object_key: Some(object_key.clone()),
+            public_url: public_url.clone(),
+            thumbnail_url: public_url.or(dev_url),
+            width: None,
+            height: None,
+            duration_seconds: None,
+            expires_at: None,
+            saved_at: Some(now),
+            created_at: now,
+            updated_at: now,
+        };
+        let mut inner = self.inner.lock().expect("store lock poisoned");
+        inner.media.insert(media_id.clone(), media.clone());
+        push_event_inner(
+            &mut inner,
+            Some(&self.events_tx),
+            Some(&self.event_bus),
+            new_event(
+                "media.stored",
+                project_id,
+                company_id,
+                Some(channel_id.to_string()),
+                Some(entity_id.to_string()),
+                None,
+                None,
+                json!({
+                    "media_id": media_id,
+                    "media_type": "image",
+                    "storage_status": "permanent",
+                    "entity_type": entity_type
+                }),
+            ),
+        );
+        self.persist_locked(&inner);
+        Ok(media)
     }
 
     pub async fn copy_media_bytes(
@@ -6644,6 +6900,15 @@ fn record_message_inner(
             phone_number: conversation_display_phone
                 .as_deref()
                 .and_then(phone_number_from_e164),
+            profile_picture_media_id: if is_group {
+                group_record
+                    .as_ref()
+                    .and_then(|group| group.profile_picture_media_id.clone())
+            } else {
+                contact
+                    .as_ref()
+                    .and_then(|contact| contact.profile_picture_media_id.clone())
+            },
             avatar_url: if is_group {
                 group_record
                     .as_ref()
@@ -6839,6 +7104,15 @@ fn ensure_conversation_inner(
                 None
             } else {
                 contact.as_ref().and_then(contact_phone_number)
+            },
+            profile_picture_media_id: if is_group {
+                group_record
+                    .as_ref()
+                    .and_then(|group| group.profile_picture_media_id.clone())
+            } else {
+                contact
+                    .as_ref()
+                    .and_then(|contact| contact.profile_picture_media_id.clone())
             },
             avatar_url: if is_group {
                 group_record
@@ -7037,6 +7311,7 @@ fn contact_profile_from_alt(contact_id: &str, alt_jid: Option<&str>) -> Option<C
         phone_e164,
         business_description: None,
         profile_picture_id: None,
+        profile_picture_media_id: None,
         profile_picture_url: None,
     })
 }
@@ -7105,6 +7380,9 @@ fn enrich_contact_inner(
         if let Some(profile_picture_url) = profile_picture_url.clone() {
             entry.avatar_url = Some(profile_picture_url.clone());
             entry.profile_picture_url = Some(profile_picture_url);
+        }
+        if let Some(profile_picture_media_id) = input.profile.profile_picture_media_id.clone() {
+            entry.profile_picture_media_id = Some(profile_picture_media_id);
         }
         if let Some(description) = input
             .profile
@@ -7263,6 +7541,9 @@ fn apply_contact_to_conversation(
     if contact.profile_picture_url.is_some() {
         conversation.profile_picture_url = contact.profile_picture_url.clone();
     }
+    if contact.profile_picture_media_id.is_some() {
+        conversation.profile_picture_media_id = contact.profile_picture_media_id.clone();
+    }
     conversation.updated_at = OffsetDateTime::now_utc();
 }
 
@@ -7321,6 +7602,7 @@ fn group_conversation(
         display_name: Some(group_subject_for_jid(group_id)),
         display_phone: None,
         phone_number: None,
+        profile_picture_media_id: None,
         avatar_url: None,
         profile_picture_url: None,
         last_seq: 0,
@@ -7350,6 +7632,8 @@ fn apply_group_record_to_conversation(
             .and_then(|group| group.subject.clone())
             .unwrap_or_else(|| group_subject_for_jid(group_id)),
     );
+    conversation.profile_picture_media_id =
+        group.and_then(|group| group.profile_picture_media_id.clone());
     conversation.avatar_url = group.and_then(|group| group.avatar_url.clone());
     conversation.profile_picture_url = group.and_then(|group| group.profile_picture_url.clone());
 }
@@ -7582,6 +7866,15 @@ fn extension_for_mime(mime_type: &str) -> &'static str {
         "application/pdf" => "pdf",
         "text/plain" => "txt",
         _ => "bin",
+    }
+}
+
+fn sniff_profile_picture_mime(bytes: &[u8]) -> ApiResult<&'static str> {
+    match sniff_mime_from_magic(bytes) {
+        Some(mime @ ("image/jpeg" | "image/png" | "image/webp")) => Ok(mime),
+        _ => Err(ApiError::BadRequest(
+            "profile picture image has unsupported magic bytes".to_string(),
+        )),
     }
 }
 
@@ -8119,10 +8412,19 @@ fn ts(value: OffsetDateTime) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, path::PathBuf};
 
     use super::*;
-    use crate::config::AppConfig;
+    use crate::config::{AppConfig, StorageProvider};
+
+    fn state_with_temp_media() -> (AppState, PathBuf) {
+        let mut config = AppConfig::from_env();
+        let dir = std::env::temp_dir().join(format!("rustzap-profile-media-{}", Uuid::now_v7()));
+        config.storage_provider = StorageProvider::LocalFs;
+        config.local_storage_dir = dir.clone();
+        config.dev_mode = true;
+        (AppState::new(config), dir)
+    }
 
     #[test]
     fn idempotency_replays_same_hash_and_conflicts_on_different_hash() {
@@ -9689,6 +9991,58 @@ mod tests {
     }
 
     #[test]
+    fn profile_picture_media_bytes_create_real_media_with_pii_safe_key() {
+        let (state, dir) = state_with_temp_media();
+        let bytes = b"\x89PNG\r\n\x1a\nprofile-bytes".to_vec();
+
+        let media = state
+            .store_profile_picture_media_bytes(
+                "p",
+                "c",
+                "channel_main",
+                "contact_profile_picture",
+                "5511999999999@s.whatsapp.net",
+                bytes,
+            )
+            .unwrap();
+
+        assert!(media.id.starts_with("media_"));
+        assert_eq!(media.mime_type, "image/png");
+        assert_eq!(media.storage_status, "permanent");
+        let object_key = media.object_key.as_deref().unwrap();
+        assert!(object_key.contains("entity_id_hash="));
+        assert!(!object_key.contains("5511999999999"));
+        assert!(!object_key.contains("@s.whatsapp.net"));
+        assert!(!object_key.contains("maria"));
+        assert_eq!(
+            state.media(&media.id).unwrap().id,
+            media.id,
+            "stored media is addressable by RustZap media id"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn profile_picture_media_bytes_reject_invalid_image_magic() {
+        let (state, dir) = state_with_temp_media();
+
+        let err = state
+            .store_profile_picture_media_bytes(
+                "p",
+                "c",
+                "channel_main",
+                "group_profile_picture",
+                "120363000000000000@g.us",
+                b"not an image".to_vec(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, ApiError::BadRequest(_)));
+        assert!(state.events().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn contact_profile_enrichment_updates_lid_conversation() {
         let state = AppState::new(AppConfig::from_env());
         state.receive_inbound_text(
@@ -9718,6 +10072,7 @@ mod tests {
                 phone_e164: Some("+5511999999999".to_string()),
                 business_description: None,
                 profile_picture_id: Some("pic_1".to_string()),
+                profile_picture_media_id: Some("media_contact_1".to_string()),
                 profile_picture_url: Some("https://example.test/profile.jpg".to_string()),
             },
         });
@@ -9736,6 +10091,7 @@ mod tests {
 
         let serialized = serde_json::to_value(&conversation).unwrap();
         assert_eq!(serialized["phone_number"], "5511999999999");
+        assert_eq!(serialized["profile_picture_media_id"], "media_contact_1");
 
         let contact = state.contact_by_phone("p", "c", "5511999999999").unwrap();
         assert_eq!(contact["id"], "5511999999999");
@@ -9785,6 +10141,7 @@ mod tests {
                 phone_e164: Some("+5511999999999".to_string()),
                 business_description: Some("Atendimento imobiliario".to_string()),
                 profile_picture_id: Some("pic_contact".to_string()),
+                profile_picture_media_id: Some("media_contact_profile".to_string()),
                 profile_picture_url: Some("https://example.test/contact.jpg".to_string()),
             },
         });
@@ -9795,6 +10152,8 @@ mod tests {
             contact["profile_picture_url"],
             "https://example.test/contact.jpg"
         );
+        assert_eq!(contact["profile_picture_media_id"], "media_contact_profile");
+        assert_ne!(contact["profile_picture_media_id"], "pic_contact");
         assert_eq!(contact["canonical_jid"], contact_id);
     }
 
@@ -9829,6 +10188,7 @@ mod tests {
                 phone_e164: Some("+5511888888888".to_string()),
                 business_description: None,
                 profile_picture_id: Some("pic_sender".to_string()),
+                profile_picture_media_id: Some("media_sender_profile".to_string()),
                 profile_picture_url: Some("https://example.test/sender.jpg".to_string()),
             },
         });
@@ -9886,6 +10246,7 @@ mod tests {
                 created_at_wa_unix: Some(1_700_000_000),
                 size: Some(2),
                 profile_picture_id: Some("pic_group".to_string()),
+                profile_picture_media_id: Some("media_group_profile".to_string()),
                 profile_picture_url: Some("https://example.test/group.jpg".to_string()),
                 participants: vec![
                     GroupParticipantProfile {
@@ -9911,6 +10272,10 @@ mod tests {
             conversation.profile_picture_url.as_deref(),
             Some("https://example.test/group.jpg")
         );
+        assert_eq!(
+            conversation.profile_picture_media_id.as_deref(),
+            Some("media_group_profile")
+        );
 
         let group = state.group("p", "c", group_id).unwrap();
         assert_eq!(group["subject"], "Equipe RustZap");
@@ -9923,6 +10288,8 @@ mod tests {
             group["profile_picture_url"],
             "https://example.test/group.jpg"
         );
+        assert_eq!(group["profile_picture_media_id"], "media_group_profile");
+        assert_ne!(group["profile_picture_media_id"], "pic_group");
 
         let members = state.group_members(group_id);
         let existing = members
@@ -10306,6 +10673,7 @@ mod tests {
                 display_name: Some("Status".to_string()),
                 display_phone: None,
                 phone_number: None,
+                profile_picture_media_id: None,
                 avatar_url: None,
                 profile_picture_url: None,
                 last_seq: 1,

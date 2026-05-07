@@ -161,6 +161,7 @@ pub struct ContactProfile {
     pub phone_e164: Option<String>,
     pub business_description: Option<String>,
     pub profile_picture_id: Option<String>,
+    pub profile_picture_media_id: Option<String>,
     pub profile_picture_url: Option<String>,
 }
 
@@ -174,6 +175,7 @@ pub struct GroupProfile {
     pub created_at_wa_unix: Option<u64>,
     pub size: Option<u32>,
     pub profile_picture_id: Option<String>,
+    pub profile_picture_media_id: Option<String>,
     pub profile_picture_url: Option<String>,
     pub participants: Vec<GroupParticipantProfile>,
 }
@@ -589,6 +591,7 @@ impl WhatsappManager {
             phone_e164: phone_from_jid_str(jid),
             business_description: None,
             profile_picture_id: None,
+            profile_picture_media_id: None,
             profile_picture_url: None,
         };
 
@@ -731,6 +734,7 @@ impl WhatsappManager {
             created_at_wa_unix: metadata.creation_time,
             size: metadata.size,
             profile_picture_id: None,
+            profile_picture_media_id: None,
             profile_picture_url: None,
             participants,
         };
