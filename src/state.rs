@@ -2891,13 +2891,13 @@ impl AppState {
                 .and_then(|contact| contact.profile_picture_url.clone())
         };
         let profile_picture_media_id = if is_group {
-            group_record
-                .as_ref()
-                .and_then(|group| group.profile_picture_media_id.clone())
+            group_record.as_ref().and_then(|group| {
+                rustzap_profile_picture_media_id(group.profile_picture_media_id.as_deref())
+            })
         } else {
-            contact
-                .as_ref()
-                .and_then(|contact| contact.profile_picture_media_id.clone())
+            contact.as_ref().and_then(|contact| {
+                rustzap_profile_picture_media_id(contact.profile_picture_media_id.as_deref())
+            })
         };
         let conversation = inner
             .conversations
@@ -3442,7 +3442,8 @@ impl AppState {
         });
         let metadata_members_count = profile.size;
         let profile_picture_provider_id = profile.profile_picture_id.clone();
-        let profile_picture_media_id = profile.profile_picture_media_id.clone();
+        let profile_picture_media_id =
+            rustzap_profile_picture_media_id(profile.profile_picture_media_id.as_deref());
         let profile_picture_url = profile.profile_picture_url.clone();
         let participants = profile.participants;
         let members_count = metadata_members_count
@@ -6901,13 +6902,13 @@ fn record_message_inner(
                 .as_deref()
                 .and_then(phone_number_from_e164),
             profile_picture_media_id: if is_group {
-                group_record
-                    .as_ref()
-                    .and_then(|group| group.profile_picture_media_id.clone())
+                group_record.as_ref().and_then(|group| {
+                    rustzap_profile_picture_media_id(group.profile_picture_media_id.as_deref())
+                })
             } else {
-                contact
-                    .as_ref()
-                    .and_then(|contact| contact.profile_picture_media_id.clone())
+                contact.as_ref().and_then(|contact| {
+                    rustzap_profile_picture_media_id(contact.profile_picture_media_id.as_deref())
+                })
             },
             avatar_url: if is_group {
                 group_record
@@ -7106,13 +7107,13 @@ fn ensure_conversation_inner(
                 contact.as_ref().and_then(contact_phone_number)
             },
             profile_picture_media_id: if is_group {
-                group_record
-                    .as_ref()
-                    .and_then(|group| group.profile_picture_media_id.clone())
+                group_record.as_ref().and_then(|group| {
+                    rustzap_profile_picture_media_id(group.profile_picture_media_id.as_deref())
+                })
             } else {
-                contact
-                    .as_ref()
-                    .and_then(|contact| contact.profile_picture_media_id.clone())
+                contact.as_ref().and_then(|contact| {
+                    rustzap_profile_picture_media_id(contact.profile_picture_media_id.as_deref())
+                })
             },
             avatar_url: if is_group {
                 group_record
@@ -7381,8 +7382,9 @@ fn enrich_contact_inner(
             entry.avatar_url = Some(profile_picture_url.clone());
             entry.profile_picture_url = Some(profile_picture_url);
         }
-        if let Some(profile_picture_media_id) = input.profile.profile_picture_media_id.clone() {
-            entry.profile_picture_media_id = Some(profile_picture_media_id);
+        if input.profile.profile_picture_media_id.is_some() {
+            entry.profile_picture_media_id =
+                rustzap_profile_picture_media_id(input.profile.profile_picture_media_id.as_deref());
         }
         if let Some(description) = input
             .profile
@@ -7541,9 +7543,8 @@ fn apply_contact_to_conversation(
     if contact.profile_picture_url.is_some() {
         conversation.profile_picture_url = contact.profile_picture_url.clone();
     }
-    if contact.profile_picture_media_id.is_some() {
-        conversation.profile_picture_media_id = contact.profile_picture_media_id.clone();
-    }
+    conversation.profile_picture_media_id =
+        rustzap_profile_picture_media_id(contact.profile_picture_media_id.as_deref());
     conversation.updated_at = OffsetDateTime::now_utc();
 }
 
@@ -7632,8 +7633,9 @@ fn apply_group_record_to_conversation(
             .and_then(|group| group.subject.clone())
             .unwrap_or_else(|| group_subject_for_jid(group_id)),
     );
-    conversation.profile_picture_media_id =
-        group.and_then(|group| group.profile_picture_media_id.clone());
+    conversation.profile_picture_media_id = group.and_then(|group| {
+        rustzap_profile_picture_media_id(group.profile_picture_media_id.as_deref())
+    });
     conversation.avatar_url = group.and_then(|group| group.avatar_url.clone());
     conversation.profile_picture_url = group.and_then(|group| group.profile_picture_url.clone());
 }
@@ -7796,6 +7798,23 @@ fn contact_phone_number(contact: &ContactRecord) -> Option<String> {
         .or_else(|| phone_number_from_jid(&contact.id))
 }
 
+fn rustzap_profile_picture_media_id(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| is_rustzap_media_id(value))
+        .map(str::to_string)
+}
+
+fn is_rustzap_media_id(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix("media_") else {
+        return false;
+    };
+    suffix.len() == 32
+        && suffix
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+}
+
 fn display_name_for_jid(jid: &str) -> String {
     phone_from_jid(jid).unwrap_or_else(|| jid.split('@').next().unwrap_or(jid).to_string())
 }
@@ -7939,6 +7958,8 @@ fn xml_escape(value: &str) -> String {
 
 fn contact_json(contact: &ContactRecord) -> Value {
     let phone_number = contact_phone_number(contact);
+    let profile_picture_media_id =
+        rustzap_profile_picture_media_id(contact.profile_picture_media_id.as_deref());
     json!({
         "id": phone_number.as_deref().unwrap_or(&contact.id),
         "technical_id": contact.id,
@@ -7948,7 +7969,7 @@ fn contact_json(contact: &ContactRecord) -> Value {
         "phone_number": phone_number,
         "push_name": contact.push_name,
         "display_name": contact.display_name,
-        "profile_picture_media_id": contact.profile_picture_media_id,
+        "profile_picture_media_id": profile_picture_media_id,
         "business_description": contact.business_description,
         "avatar_url": contact.avatar_url,
         "profile_picture_url": contact.profile_picture_url,
@@ -7975,7 +7996,9 @@ fn group_json(inner: &StoreInner, conversation: &crate::models::Conversation) ->
     let owner_jid = group.and_then(|group| group.owner_jid.clone());
     let subject_owner_jid = group.and_then(|group| group.subject_owner_jid.clone());
     let created_at_wa = group.and_then(|group| group.created_at_wa.map(ts));
-    let profile_picture_media_id = group.and_then(|group| group.profile_picture_media_id.clone());
+    let profile_picture_media_id = group.and_then(|group| {
+        rustzap_profile_picture_media_id(group.profile_picture_media_id.as_deref())
+    });
     let avatar_url = group.and_then(|group| group.avatar_url.clone());
     let profile_picture_url = group.and_then(|group| group.profile_picture_url.clone());
     json!({
@@ -8057,6 +8080,8 @@ fn apply_public_conversation_fields(
     inner: &StoreInner,
     conversation: &mut crate::models::Conversation,
 ) {
+    conversation.profile_picture_media_id =
+        rustzap_profile_picture_media_id(conversation.profile_picture_media_id.as_deref());
     if conversation.conversation_type == "group" {
         conversation.phone_number = None;
         return;
@@ -10072,7 +10097,9 @@ mod tests {
                 phone_e164: Some("+5511999999999".to_string()),
                 business_description: None,
                 profile_picture_id: Some("pic_1".to_string()),
-                profile_picture_media_id: Some("media_contact_1".to_string()),
+                profile_picture_media_id: Some(
+                    "media_018f6a3b2c4d7e8091a2b3c4d5e6f701".to_string(),
+                ),
                 profile_picture_url: Some("https://example.test/profile.jpg".to_string()),
             },
         });
@@ -10091,7 +10118,10 @@ mod tests {
 
         let serialized = serde_json::to_value(&conversation).unwrap();
         assert_eq!(serialized["phone_number"], "5511999999999");
-        assert_eq!(serialized["profile_picture_media_id"], "media_contact_1");
+        assert_eq!(
+            serialized["profile_picture_media_id"],
+            "media_018f6a3b2c4d7e8091a2b3c4d5e6f701"
+        );
 
         let contact = state.contact_by_phone("p", "c", "5511999999999").unwrap();
         assert_eq!(contact["id"], "5511999999999");
@@ -10141,7 +10171,9 @@ mod tests {
                 phone_e164: Some("+5511999999999".to_string()),
                 business_description: Some("Atendimento imobiliario".to_string()),
                 profile_picture_id: Some("pic_contact".to_string()),
-                profile_picture_media_id: Some("media_contact_profile".to_string()),
+                profile_picture_media_id: Some(
+                    "media_018f6a3b2c4d7e8091a2b3c4d5e6f702".to_string(),
+                ),
                 profile_picture_url: Some("https://example.test/contact.jpg".to_string()),
             },
         });
@@ -10152,7 +10184,10 @@ mod tests {
             contact["profile_picture_url"],
             "https://example.test/contact.jpg"
         );
-        assert_eq!(contact["profile_picture_media_id"], "media_contact_profile");
+        assert_eq!(
+            contact["profile_picture_media_id"],
+            "media_018f6a3b2c4d7e8091a2b3c4d5e6f702"
+        );
         assert_ne!(contact["profile_picture_media_id"], "pic_contact");
         assert_eq!(contact["canonical_jid"], contact_id);
     }
@@ -10188,7 +10223,9 @@ mod tests {
                 phone_e164: Some("+5511888888888".to_string()),
                 business_description: None,
                 profile_picture_id: Some("pic_sender".to_string()),
-                profile_picture_media_id: Some("media_sender_profile".to_string()),
+                profile_picture_media_id: Some(
+                    "media_018f6a3b2c4d7e8091a2b3c4d5e6f703".to_string(),
+                ),
                 profile_picture_url: Some("https://example.test/sender.jpg".to_string()),
             },
         });
@@ -10246,7 +10283,9 @@ mod tests {
                 created_at_wa_unix: Some(1_700_000_000),
                 size: Some(2),
                 profile_picture_id: Some("pic_group".to_string()),
-                profile_picture_media_id: Some("media_group_profile".to_string()),
+                profile_picture_media_id: Some(
+                    "media_018f6a3b2c4d7e8091a2b3c4d5e6f704".to_string(),
+                ),
                 profile_picture_url: Some("https://example.test/group.jpg".to_string()),
                 participants: vec![
                     GroupParticipantProfile {
@@ -10274,7 +10313,7 @@ mod tests {
         );
         assert_eq!(
             conversation.profile_picture_media_id.as_deref(),
-            Some("media_group_profile")
+            Some("media_018f6a3b2c4d7e8091a2b3c4d5e6f704")
         );
 
         let group = state.group("p", "c", group_id).unwrap();
@@ -10288,7 +10327,10 @@ mod tests {
             group["profile_picture_url"],
             "https://example.test/group.jpg"
         );
-        assert_eq!(group["profile_picture_media_id"], "media_group_profile");
+        assert_eq!(
+            group["profile_picture_media_id"],
+            "media_018f6a3b2c4d7e8091a2b3c4d5e6f704"
+        );
         assert_ne!(group["profile_picture_media_id"], "pic_group");
 
         let members = state.group_members(group_id);
@@ -10309,6 +10351,74 @@ mod tests {
             .unwrap();
         assert_eq!(lid["technical_contact_id"], "200889293889773@lid");
         assert_eq!(lid["display_name"], "+5511999999999");
+    }
+
+    #[test]
+    fn legacy_provider_picture_ids_are_not_exposed_as_media_ids() {
+        let state = AppState::new(AppConfig::from_env());
+        let contact_id = "5511999999999@s.whatsapp.net";
+        let group_id = "120363000000000000@g.us";
+        state.receive_inbound_text(
+            "p",
+            "c",
+            SimulateInboundTextRequest {
+                conversation_id: Some(contact_id.to_string()),
+                channel_id: Some("ch".to_string()),
+                from_phone_e164: Some("+5511999999999".to_string()),
+                sender_name: Some("Cliente RustZap".to_string()),
+                profile_picture_url: None,
+                text: "oi".to_string(),
+            },
+        );
+
+        state.apply_contact_profile(ContactProfileApplyInput {
+            project_id: "p",
+            company_id: "c",
+            channel_id: "ch",
+            conversation_id: contact_id,
+            contact_id,
+            push_name: Some("Cliente RustZap"),
+            profile: ContactProfile {
+                requested_jid: contact_id.to_string(),
+                resolved_jid: Some(contact_id.to_string()),
+                lid: None,
+                phone_e164: Some("+5511999999999".to_string()),
+                business_description: None,
+                profile_picture_id: Some("pic_contact_legacy".to_string()),
+                profile_picture_media_id: Some("pic_contact_legacy".to_string()),
+                profile_picture_url: Some("https://example.test/contact.jpg".to_string()),
+            },
+        });
+
+        state.apply_group_profile(
+            "p",
+            "c",
+            "ch",
+            group_id,
+            GroupProfile {
+                group_jid: group_id.to_string(),
+                subject: Some("Equipe RustZap".to_string()),
+                description: None,
+                owner_jid: None,
+                subject_owner_jid: None,
+                created_at_wa_unix: None,
+                size: Some(0),
+                profile_picture_id: Some("pic_group_legacy".to_string()),
+                profile_picture_media_id: Some("pic_group_legacy".to_string()),
+                profile_picture_url: Some("https://example.test/group.jpg".to_string()),
+                participants: vec![],
+            },
+        );
+
+        let contact = state.contact("p", "c", contact_id).unwrap();
+        assert!(contact["profile_picture_media_id"].is_null());
+        let conversation = state.conversation("p", "c", "5511999999999").unwrap();
+        assert!(conversation.profile_picture_media_id.is_none());
+
+        let group_conversation = state.conversation("p", "c", group_id).unwrap();
+        assert!(group_conversation.profile_picture_media_id.is_none());
+        let group = state.group("p", "c", group_id).unwrap();
+        assert!(group["profile_picture_media_id"].is_null());
     }
 
     #[test]
