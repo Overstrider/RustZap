@@ -12,7 +12,8 @@ aes-gcm = "0.10"
 getrandom = "0.3"
 hex = "0.4"
 hmac = "0.12"
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+futures-util = "0.3.32"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 rusty-s3 = "0.9.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -40,6 +41,5 @@ default = []
 external-integrations = ["dep:rdkafka"]
 
 [dev-dependencies]
-futures-util = "0.3.32"
 tokio-tungstenite = "0.29.0"
 tower = { version = "0.5", features = ["util"] }

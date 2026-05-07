@@ -19,6 +19,7 @@ use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use futures_util::StreamExt;
 
 use crate::{
     config::{AppConfig, ConsumerSignalMode, EventBusMode, MetadataDbMode, StorageProvider},
@@ -47,6 +48,8 @@ use crate::{
         is_updates_surface_jid, qr_expires_at, session_sqlite_path,
     },
 };
+
+const PROFILE_PICTURE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -4734,11 +4737,7 @@ impl AppState {
                 response.status().as_u16()
             )));
         }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|_| ApiError::ProviderError("profile picture download failed".to_string()))?
-            .to_vec();
+        let bytes = Self::read_profile_picture_response_bytes(response).await?;
         let media = self.store_profile_picture_media_bytes(
             project_id,
             company_id,
@@ -4749,6 +4748,42 @@ impl AppState {
         )?;
         *target = Some(media.id);
         Ok(())
+    }
+
+    async fn read_profile_picture_response_bytes(
+        response: reqwest::Response,
+    ) -> ApiResult<Vec<u8>> {
+        if response
+            .content_length()
+            .is_some_and(|length| length > PROFILE_PICTURE_MAX_BYTES)
+        {
+            return Err(ApiError::PayloadTooLarge(format!(
+                "profile picture image is larger than {} MB",
+                PROFILE_PICTURE_MAX_BYTES / 1024 / 1024
+            )));
+        }
+
+        let mut bytes = Vec::with_capacity(
+            response
+                .content_length()
+                .and_then(|length| usize::try_from(length).ok())
+                .unwrap_or_default(),
+        );
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| {
+                ApiError::ProviderError("profile picture download failed".to_string())
+            })?;
+            let next_len = bytes.len().saturating_add(chunk.len());
+            if u64::try_from(next_len).unwrap_or(u64::MAX) > PROFILE_PICTURE_MAX_BYTES {
+                return Err(ApiError::PayloadTooLarge(format!(
+                    "profile picture image is larger than {} MB",
+                    PROFILE_PICTURE_MAX_BYTES / 1024 / 1024
+                )));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
     }
 
     fn store_profile_picture_media_bytes(
@@ -10071,6 +10106,59 @@ mod tests {
 
         assert!(matches!(err, ApiError::BadRequest(_)));
         assert!(state.events().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn profile_picture_download_rejects_oversized_content_length() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route(
+            "/avatar.png",
+            axum::routing::get(|| async {
+                let mut body = b"\x89PNG\r\n\x1a\nsmall-avatar".to_vec();
+                body.resize(usize::try_from(PROFILE_PICTURE_MAX_BYTES + 1).unwrap(), 0);
+                axum::http::Response::builder()
+                    .header(
+                        axum::http::header::CONTENT_LENGTH,
+                        (PROFILE_PICTURE_MAX_BYTES + 1).to_string(),
+                    )
+                    .header(axum::http::header::CONTENT_TYPE, "image/png")
+                    .body(axum::body::Body::from(body))
+                    .unwrap()
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (state, dir) = state_with_temp_media();
+        let mut media_id = None;
+
+        let err = state
+            .attach_profile_picture_media_id(
+                "p",
+                "c",
+                "channel_main",
+                "contact_profile_picture",
+                "5511999999999@s.whatsapp.net",
+                &mut media_id,
+                Some(&format!("http://{addr}/avatar.png")),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ApiError::PayloadTooLarge(_)));
+        assert!(media_id.is_none());
+        assert!(state.events().is_empty());
+        assert!(
+            state
+                .inner
+                .lock()
+                .expect("store lock poisoned")
+                .media
+                .is_empty()
+        );
+        server.abort();
         let _ = std::fs::remove_dir_all(dir);
     }
 
