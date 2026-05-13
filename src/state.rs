@@ -198,7 +198,9 @@ pub(crate) struct ContactRecord {
     pub(crate) business_description: Option<String>,
     pub(crate) avatar_url: Option<String>,
     pub(crate) profile_picture_url: Option<String>,
+    #[serde(with = "crate::models::serde_time_compat")]
     pub(crate) first_contact_at: OffsetDateTime,
+    #[serde(with = "crate::models::serde_time_compat")]
     pub(crate) last_contact_at: OffsetDateTime,
 }
 
@@ -214,10 +216,13 @@ pub(crate) struct GroupMemberRecord {
     pub(crate) role: String,
     pub(crate) is_admin: bool,
     #[serde(default = "default_now")]
+    #[serde(with = "crate::models::serde_time_compat")]
     pub(crate) joined_at: OffsetDateTime,
     #[serde(default = "default_now")]
+    #[serde(with = "crate::models::serde_time_compat")]
     pub(crate) updated_at: OffsetDateTime,
     #[serde(default = "default_now")]
+    #[serde(with = "crate::models::serde_time_compat")]
     pub(crate) last_seen_at: OffsetDateTime,
 }
 
@@ -237,6 +242,7 @@ pub(crate) struct GroupRecord {
     pub(crate) avatar_url: Option<String>,
     pub(crate) profile_picture_url: Option<String>,
     #[serde(default)]
+    #[serde(with = "crate::models::serde_time_compat::option")]
     pub(crate) created_at_wa: Option<OffsetDateTime>,
     #[serde(default)]
     pub(crate) members_count: Option<u32>,
@@ -288,6 +294,7 @@ pub(crate) struct PersistedStore {
     pub(crate) contacts: HashMap<String, ContactRecord>,
     pub(crate) groups: HashMap<String, GroupRecord>,
     pub(crate) group_members: HashMap<String, HashMap<String, GroupMemberRecord>>,
+    #[serde(with = "crate::models::serde_time_compat::map")]
     pub(crate) group_profile_refreshes: HashMap<String, OffsetDateTime>,
     pub(crate) media: HashMap<String, MediaObject>,
     pub(crate) transcripts: HashMap<String, Transcript>,
@@ -658,14 +665,17 @@ pub(crate) struct DirtyRecord {
     pub(crate) max_seq: i64,
     pub(crate) reason: String,
     pub(crate) priority: i32,
+    #[serde(with = "crate::models::serde_time_compat")]
     pub(crate) available_at: OffsetDateTime,
     pub(crate) lease_token: Option<String>,
+    #[serde(with = "crate::models::serde_time_compat::option")]
     pub(crate) locked_until: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct DirtyLeaseRecord {
     pub(crate) lease_token: String,
+    #[serde(with = "crate::models::serde_time_compat")]
     pub(crate) locked_until: OffsetDateTime,
     pub(crate) max_seq: i64,
 }
@@ -8644,6 +8654,53 @@ mod tests {
             media.object_key.as_deref()
         );
         assert!(!json.to_string().contains("sensitive-media-bytes"));
+    }
+
+    #[test]
+    fn persisted_store_accepts_legacy_message_time_arrays_and_rewrites_rfc3339() {
+        let message = json!({
+            "id": "msg_legacy_time",
+            "project_id": "p",
+            "company_id": "c",
+            "conversation_id": "conv",
+            "channel_account_id": "ch",
+            "conversation_seq": 1,
+            "wa_message_id": null,
+            "direction": "inbound",
+            "sender_contact_id": null,
+            "sender_display_name": null,
+            "message_type": "text",
+            "text": "oi",
+            "media_id": null,
+            "media_url": null,
+            "thumbnail_url": null,
+            "mime_type": null,
+            "file_name": null,
+            "quoted_message_id": null,
+            "status": "received",
+            "error_message": null,
+            "is_starred": false,
+            "is_pinned": false,
+            "reaction": null,
+            "sent_by_source": null,
+            "sent_by_external_user_id": null,
+            "created_at_wa": [2026, 133, 17, 37, 21, 0, 0, 0, 0],
+            "created_at": [2026, 133, 17, 37, 21, 767582565, 0, 0, 0],
+            "updated_at": [2026, 133, 17, 37, 21, 767582565, 0, 0, 0]
+        });
+        let store: PersistedStore = serde_json::from_value(json!({
+            "messages_by_id": {
+                "msg_legacy_time": message.clone()
+            },
+            "messages_by_conversation": {
+                "conv": [message]
+            }
+        }))
+        .unwrap();
+
+        let serialized = serde_json::to_value(store).unwrap();
+        assert!(serialized["messages_by_id"]["msg_legacy_time"]["created_at"].is_string());
+        assert!(serialized["messages_by_conversation"]["conv"][0]["updated_at"].is_string());
     }
 
     #[test]

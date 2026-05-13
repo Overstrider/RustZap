@@ -2,6 +2,148 @@ use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 use serde_json::Value;
 use time::OffsetDateTime;
 
+pub(crate) mod serde_time_compat {
+    use std::collections::HashMap;
+
+    use serde::{Deserialize, Deserializer, Serializer, de, ser::SerializeMap};
+    use serde_json::Value;
+    use time::{Date, OffsetDateTime, PrimitiveDateTime, Time, UtcOffset};
+
+    pub(crate) fn to_rfc3339<E>(value: &OffsetDateTime) -> Result<String, E>
+    where
+        E: serde::ser::Error,
+    {
+        value
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(E::custom)
+    }
+
+    pub(crate) fn from_json_value<E>(value: Value) -> Result<OffsetDateTime, E>
+    where
+        E: de::Error,
+    {
+        match value {
+            Value::String(value) => {
+                OffsetDateTime::parse(&value, &time::format_description::well_known::Rfc3339)
+                    .map_err(E::custom)
+            }
+            Value::Array(values) => {
+                let mut parts = Vec::with_capacity(values.len());
+                for value in values {
+                    let Some(part) = value.as_i64() else {
+                        return Err(E::custom(
+                            "legacy OffsetDateTime array contains non-integer",
+                        ));
+                    };
+                    parts.push(part);
+                }
+                legacy_array_to_offset_datetime(&parts).map_err(E::custom)
+            }
+            _ => Err(E::custom(
+                "expected RFC3339 string or legacy OffsetDateTime array",
+            )),
+        }
+    }
+
+    fn legacy_array_to_offset_datetime(parts: &[i64]) -> Result<OffsetDateTime, String> {
+        if parts.len() != 9 {
+            return Err(format!(
+                "legacy OffsetDateTime array must have 9 values, got {}",
+                parts.len()
+            ));
+        }
+        let year = i32::try_from(parts[0]).map_err(|_| "year out of range")?;
+        let ordinal = u16::try_from(parts[1]).map_err(|_| "ordinal out of range")?;
+        let hour = u8::try_from(parts[2]).map_err(|_| "hour out of range")?;
+        let minute = u8::try_from(parts[3]).map_err(|_| "minute out of range")?;
+        let second = u8::try_from(parts[4]).map_err(|_| "second out of range")?;
+        let nanos = u32::try_from(parts[5]).map_err(|_| "nanoseconds out of range")?;
+        let offset_hour = i8::try_from(parts[6]).map_err(|_| "offset hour out of range")?;
+        let offset_minute = i8::try_from(parts[7]).map_err(|_| "offset minute out of range")?;
+        let offset_second = i8::try_from(parts[8]).map_err(|_| "offset second out of range")?;
+
+        let date = Date::from_ordinal_date(year, ordinal).map_err(|err| err.to_string())?;
+        let time =
+            Time::from_hms_nano(hour, minute, second, nanos).map_err(|err| err.to_string())?;
+        let offset = UtcOffset::from_hms(offset_hour, offset_minute, offset_second)
+            .map_err(|err| err.to_string())?;
+        Ok(PrimitiveDateTime::new(date, time).assume_offset(offset))
+    }
+
+    pub(crate) fn serialize<S>(value: &OffsetDateTime, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&to_rfc3339(value)?)
+    }
+
+    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<OffsetDateTime, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        from_json_value(Value::deserialize(deserializer)?)
+    }
+
+    pub(crate) mod option {
+        use super::*;
+
+        pub(crate) fn serialize<S>(
+            value: &Option<OffsetDateTime>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            match value {
+                Some(value) => serializer.serialize_some(&to_rfc3339(value)?),
+                None => serializer.serialize_none(),
+            }
+        }
+
+        pub(crate) fn deserialize<'de, D>(
+            deserializer: D,
+        ) -> Result<Option<OffsetDateTime>, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            match Option::<Value>::deserialize(deserializer)? {
+                Some(Value::Null) | None => Ok(None),
+                Some(value) => from_json_value(value).map(Some),
+            }
+        }
+    }
+
+    pub(crate) mod map {
+        use super::*;
+
+        pub(crate) fn serialize<S>(
+            value: &HashMap<String, OffsetDateTime>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            let mut map = serializer.serialize_map(Some(value.len()))?;
+            for (key, value) in value {
+                map.serialize_entry(key, &to_rfc3339(value)?)?;
+            }
+            map.end()
+        }
+
+        pub(crate) fn deserialize<'de, D>(
+            deserializer: D,
+        ) -> Result<HashMap<String, OffsetDateTime>, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            HashMap::<String, Value>::deserialize(deserializer)?
+                .into_iter()
+                .map(|(key, value)| from_json_value(value).map(|value| (key, value)))
+                .collect()
+        }
+    }
+}
+
 pub const INTERNAL_PROJECT_ID: &str = "rustzap_internal";
 
 pub fn internal_project_id() -> String {
@@ -178,16 +320,16 @@ pub struct Conversation {
     pub avatar_url: Option<String>,
     pub profile_picture_url: Option<String>,
     pub last_seq: i64,
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(with = "crate::models::serde_time_compat::option")]
     pub last_message_at: Option<OffsetDateTime>,
     pub unread_count: i64,
     pub is_archived: bool,
     pub is_muted: bool,
     pub is_pinned: bool,
     pub control_mode: String,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::models::serde_time_compat")]
     pub created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::models::serde_time_compat")]
     pub updated_at: OffsetDateTime,
 }
 
@@ -245,11 +387,11 @@ pub struct Message {
     pub reaction: Option<String>,
     pub sent_by_source: Option<String>,
     pub sent_by_external_user_id: Option<String>,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::models::serde_time_compat")]
     pub created_at_wa: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::models::serde_time_compat")]
     pub created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::models::serde_time_compat")]
     pub updated_at: OffsetDateTime,
 }
 
@@ -291,9 +433,18 @@ impl Serialize for Message {
         state.serialize_field("reaction", &self.reaction)?;
         state.serialize_field("sent_by_source", &self.sent_by_source)?;
         state.serialize_field("sent_by_external_user_id", &self.sent_by_external_user_id)?;
-        state.serialize_field("created_at_wa", &self.created_at_wa)?;
-        state.serialize_field("created_at", &self.created_at)?;
-        state.serialize_field("updated_at", &self.updated_at)?;
+        state.serialize_field(
+            "created_at_wa",
+            &serde_time_compat::to_rfc3339::<S::Error>(&self.created_at_wa)?,
+        )?;
+        state.serialize_field(
+            "created_at",
+            &serde_time_compat::to_rfc3339::<S::Error>(&self.created_at)?,
+        )?;
+        state.serialize_field(
+            "updated_at",
+            &serde_time_compat::to_rfc3339::<S::Error>(&self.updated_at)?,
+        )?;
         state.end()
     }
 }
@@ -371,7 +522,7 @@ pub struct QrState {
     pub channel_id: String,
     pub status: String,
     pub qr_code_text: Option<String>,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::models::serde_time_compat")]
     pub expires_at: OffsetDateTime,
 }
 
@@ -399,13 +550,13 @@ pub struct MediaObject {
     pub height: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_seconds: Option<f64>,
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(with = "crate::models::serde_time_compat::option")]
     pub expires_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(with = "crate::models::serde_time_compat::option")]
     pub saved_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::models::serde_time_compat")]
     pub created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::models::serde_time_compat")]
     pub updated_at: OffsetDateTime,
 }
 
@@ -423,9 +574,9 @@ pub struct Transcript {
     pub raw_response_json: Value,
     pub status: String,
     pub error_message: Option<String>,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::models::serde_time_compat")]
     pub created_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::models::serde_time_compat")]
     pub updated_at: OffsetDateTime,
 }
 
@@ -435,10 +586,10 @@ pub struct DirtyConversationItem {
     pub max_seq: i64,
     pub reason: String,
     pub priority: i32,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::models::serde_time_compat")]
     pub available_at: OffsetDateTime,
     pub lease_token: String,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::models::serde_time_compat")]
     pub locked_until: OffsetDateTime,
 }
 
@@ -465,13 +616,13 @@ pub struct WebhookDeliveryAttempt {
     pub status: String,
     pub http_status: Option<u16>,
     pub error_message: Option<String>,
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(with = "crate::models::serde_time_compat::option")]
     pub first_failed_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(with = "crate::models::serde_time_compat::option")]
     pub last_failed_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(with = "crate::models::serde_time_compat::option")]
     pub next_retry_at: Option<OffsetDateTime>,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::models::serde_time_compat")]
     pub created_at: OffsetDateTime,
 }
 
@@ -488,9 +639,9 @@ pub struct CommonEvent {
     pub trace_id: String,
     pub causation_id: Option<String>,
     pub correlation_id: String,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::models::serde_time_compat")]
     pub occurred_at: OffsetDateTime,
-    #[serde(with = "time::serde::rfc3339")]
+    #[serde(with = "crate::models::serde_time_compat")]
     pub produced_at: OffsetDateTime,
     pub payload: Value,
 }
