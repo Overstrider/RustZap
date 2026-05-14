@@ -45,6 +45,9 @@ use crate::{
     },
 };
 
+const CONTACT_PROFILE_REFRESH_INTERVAL: Duration = Duration::hours(24);
+const CONTACT_PROFILE_FAILURE_RETRY_INTERVAL: Duration = Duration::minutes(30);
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<AppConfig>,
@@ -124,6 +127,7 @@ pub struct OutboundMediaUpload {
 }
 
 struct ContactRefreshContext {
+    resolved_contact_id: String,
     channel_id: Option<String>,
     conversation_id: Option<String>,
     alt_jid: Option<String>,
@@ -196,6 +200,12 @@ pub(crate) struct ContactRecord {
     pub(crate) profile_picture_media_id: Option<String>,
     #[serde(default)]
     pub(crate) business_description: Option<String>,
+    #[serde(default)]
+    pub(crate) profile_lookup_attempted_at: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub(crate) profile_lookup_failed_at: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub(crate) profile_lookup_failure_count: u32,
     pub(crate) avatar_url: Option<String>,
     pub(crate) profile_picture_url: Option<String>,
     pub(crate) first_contact_at: OffsetDateTime,
@@ -644,6 +654,23 @@ fn normalize_group_profile_refreshes(
         .into_iter()
         .map(|(key, value)| (key.replace('\0', "|"), value))
         .collect()
+}
+
+fn contact_profile_refresh_due(contact: &ContactRecord, now: OffsetDateTime, force: bool) -> bool {
+    if force {
+        return true;
+    }
+
+    let Some(last_attempt) = contact.profile_lookup_attempted_at else {
+        return true;
+    };
+    let retry_after = if contact.profile_lookup_failed_at.is_some() {
+        CONTACT_PROFILE_FAILURE_RETRY_INTERVAL
+    } else {
+        CONTACT_PROFILE_REFRESH_INTERVAL
+    };
+
+    last_attempt <= now - retry_after
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -3083,16 +3110,72 @@ impl AppState {
             .clone()
             .or_else(|| conversation.map(|conversation| conversation.channel_account_id.clone()))
             .or_else(|| connected_channel_for_project_company(&inner, project_id, company_id));
+        let alt_jid = contact
+            .canonical_jid
+            .clone()
+            .or_else(|| contact.lid.clone())
+            .filter(|jid| jid != &resolved_contact_id);
         Ok(ContactRefreshContext {
+            resolved_contact_id,
             channel_id,
             conversation_id: conversation.map(|conversation| conversation.id.clone()),
-            alt_jid: contact
-                .canonical_jid
-                .clone()
-                .or_else(|| contact.lid.clone())
-                .filter(|jid| jid != &resolved_contact_id),
+            alt_jid,
             push_name: contact.push_name.clone(),
         })
+    }
+
+    fn reserve_contact_profile_refresh(
+        &self,
+        project_id: &str,
+        company_id: &str,
+        contact_id: &str,
+        force: bool,
+    ) -> ApiResult<bool> {
+        let mut inner = self.inner.lock().expect("store lock poisoned");
+        let resolved_contact_id =
+            resolve_contact_id_inner(&inner, project_id, company_id, contact_id);
+        let now = OffsetDateTime::now_utc();
+        let reserved = {
+            let contact = inner
+                .contacts
+                .get_mut(&resolved_contact_id)
+                .filter(|contact| {
+                    contact.project_id == project_id && contact.company_id == company_id
+                })
+                .ok_or_else(|| {
+                    ApiError::NotFound(format!("contact {resolved_contact_id} not found"))
+                })?;
+            if !contact_profile_refresh_due(contact, now, force) {
+                return Ok(false);
+            }
+            contact.profile_lookup_attempted_at = Some(now);
+            true
+        };
+        self.persist_locked(&inner);
+        Ok(reserved)
+    }
+
+    fn record_contact_profile_lookup_failure(
+        &self,
+        project_id: &str,
+        company_id: &str,
+        contact_id: &str,
+    ) {
+        let mut inner = self.inner.lock().expect("store lock poisoned");
+        let resolved_contact_id =
+            resolve_contact_id_inner(&inner, project_id, company_id, contact_id);
+        let now = OffsetDateTime::now_utc();
+        if let Some(contact) = inner
+            .contacts
+            .get_mut(&resolved_contact_id)
+            .filter(|contact| contact.project_id == project_id && contact.company_id == company_id)
+        {
+            contact.profile_lookup_attempted_at = Some(now);
+            contact.profile_lookup_failed_at = Some(now);
+            contact.profile_lookup_failure_count =
+                contact.profile_lookup_failure_count.saturating_add(1);
+            self.persist_locked(&inner);
+        }
     }
 
     fn group_refresh_channel(
@@ -3123,6 +3206,24 @@ impl AppState {
         alt_jid: Option<String>,
         push_name: Option<String>,
     ) {
+        match self.reserve_contact_profile_refresh(
+            &runtime.project_id,
+            &runtime.company_id,
+            &contact_id,
+            false,
+        ) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(err) => {
+                tracing::debug!(
+                    contact_id = %contact_id,
+                    error = %err,
+                    "contact enrichment reservation failed"
+                );
+                return;
+            }
+        }
+
         let state = self.clone();
         let project_id = runtime.project_id.clone();
         let company_id = runtime.company_id.clone();
@@ -3158,6 +3259,11 @@ impl AppState {
                             profile,
                         });
                     } else {
+                        state.record_contact_profile_lookup_failure(
+                            &project_id,
+                            &company_id,
+                            &contact_id,
+                        );
                         tracing::debug!(
                             %channel_id,
                             %contact_id,
@@ -3665,6 +3771,15 @@ impl AppState {
         if let Some(channel_id) = context.channel_id.as_deref()
             && self.channel_status(channel_id).as_deref() == Some("connected")
         {
+            if !self.reserve_contact_profile_refresh(
+                project_id,
+                company_id,
+                &context.resolved_contact_id,
+                false,
+            )? {
+                return self.contact(project_id, company_id, contact_id);
+            }
+
             match self.whatsapp.contact_profile(channel_id, contact_id).await {
                 Ok(profile) => {
                     let profile = merge_contact_profile_alt(profile, context.alt_jid.as_deref());
@@ -3679,6 +3794,11 @@ impl AppState {
                     });
                 }
                 Err(err) => {
+                    self.record_contact_profile_lookup_failure(
+                        project_id,
+                        company_id,
+                        &context.resolved_contact_id,
+                    );
                     tracing::debug!(
                         %channel_id,
                         %contact_id,
@@ -6956,6 +7076,9 @@ fn upsert_contact_inner(inner: &mut StoreInner, input: ContactUpsertInput<'_>) -
             display_name: display_name.clone(),
             profile_picture_media_id: None,
             business_description: None,
+            profile_lookup_attempted_at: None,
+            profile_lookup_failed_at: None,
+            profile_lookup_failure_count: 0,
             avatar_url: input.profile_picture_url.clone(),
             profile_picture_url: input.profile_picture_url.clone(),
             first_contact_at: input.now,
@@ -7106,6 +7229,9 @@ fn enrich_contact_inner(
             entry.avatar_url = Some(profile_picture_url.clone());
             entry.profile_picture_url = Some(profile_picture_url);
         }
+        entry.profile_lookup_attempted_at = Some(input.now);
+        entry.profile_lookup_failed_at = None;
+        entry.profile_lookup_failure_count = 0;
         if let Some(description) = input
             .profile
             .business_description
@@ -10290,6 +10416,84 @@ mod tests {
     }
 
     #[test]
+    fn contact_profile_refresh_reservation_is_persisted() {
+        let state = AppState::new(AppConfig::from_env());
+        let contact_id = "5511999999999@s.whatsapp.net";
+        state.receive_inbound_text(
+            "p",
+            "c",
+            SimulateInboundTextRequest {
+                conversation_id: Some(contact_id.to_string()),
+                channel_id: Some("ch".to_string()),
+                from_phone_e164: Some("+5511999999999".to_string()),
+                sender_name: Some("Pessoa".to_string()),
+                profile_picture_url: None,
+                text: "oi".to_string(),
+            },
+        );
+
+        assert!(
+            state
+                .reserve_contact_profile_refresh("p", "c", contact_id, false)
+                .unwrap()
+        );
+        assert!(
+            !state
+                .reserve_contact_profile_refresh("p", "c", contact_id, false)
+                .unwrap()
+        );
+
+        let persisted = {
+            let inner = state.inner.lock().expect("store lock poisoned");
+            PersistedStore::from_inner(&inner)
+        };
+        let restored = persisted.into_inner();
+        let contact = restored.contacts.get(contact_id).unwrap();
+
+        assert!(contact.profile_lookup_attempted_at.is_some());
+        assert!(!contact_profile_refresh_due(
+            contact,
+            OffsetDateTime::now_utc(),
+            false
+        ));
+    }
+
+    #[test]
+    fn failed_contact_profile_lookup_uses_retry_interval() {
+        let state = AppState::new(AppConfig::from_env());
+        let contact_id = "5511999999999@s.whatsapp.net";
+        state.receive_inbound_text(
+            "p",
+            "c",
+            SimulateInboundTextRequest {
+                conversation_id: Some(contact_id.to_string()),
+                channel_id: Some("ch".to_string()),
+                from_phone_e164: Some("+5511999999999".to_string()),
+                sender_name: Some("Pessoa".to_string()),
+                profile_picture_url: None,
+                text: "oi".to_string(),
+            },
+        );
+
+        let now = OffsetDateTime::now_utc();
+        let mut contact = {
+            let mut inner = state.inner.lock().expect("store lock poisoned");
+            let contact = inner.contacts.get_mut(contact_id).unwrap();
+            contact.profile_lookup_attempted_at = Some(now - Duration::minutes(29));
+            contact.profile_lookup_failed_at = Some(now - Duration::minutes(29));
+            contact.profile_lookup_failure_count = 1;
+            contact.clone()
+        };
+
+        assert!(!contact_profile_refresh_due(&contact, now, false));
+
+        contact.profile_lookup_attempted_at = Some(now - Duration::minutes(31));
+        contact.profile_lookup_failed_at = Some(now - Duration::minutes(31));
+
+        assert!(contact_profile_refresh_due(&contact, now, false));
+    }
+
+    #[test]
     fn persisted_store_drops_updates_surfaces() {
         let now = OffsetDateTime::now_utc();
         let mut inner = StoreInner::default();
@@ -10367,6 +10571,9 @@ mod tests {
                 display_name: "Status".to_string(),
                 profile_picture_media_id: None,
                 business_description: None,
+                profile_lookup_attempted_at: None,
+                profile_lookup_failed_at: None,
+                profile_lookup_failure_count: 0,
                 avatar_url: None,
                 profile_picture_url: None,
                 first_contact_at: now,
