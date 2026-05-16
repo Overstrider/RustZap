@@ -2214,6 +2214,7 @@ impl AppState {
                 Some(format!("WhatsApp channel {channel_id} is not connected")),
             );
         }
+        let send_target_jid = self.outbound_send_target_jid(&outcome.message);
         let send_result = if let Some(media_id) = outcome.message.media_id.as_deref() {
             let (media, bytes) = match self.media_blob(media_id).await {
                 Ok(Some(blob)) => blob,
@@ -2238,7 +2239,7 @@ impl AppState {
                 StdDuration::from_secs(30),
                 self.whatsapp.send_media(
                     &channel_id,
-                    &outcome.message.conversation_id,
+                    &send_target_jid,
                     OutboundMediaMessage {
                         media_type: media.media_type,
                         mime_type: media.mime_type,
@@ -2253,8 +2254,7 @@ impl AppState {
         } else if let Some(text) = request_text {
             tokio::time::timeout(
                 StdDuration::from_secs(15),
-                self.whatsapp
-                    .send_text(&channel_id, &outcome.message.conversation_id, text),
+                self.whatsapp.send_text(&channel_id, &send_target_jid, text),
             )
             .await
         } else {
@@ -2300,6 +2300,20 @@ impl AppState {
                 )
             }
         }
+    }
+
+    fn outbound_send_target_jid(&self, message: &Message) -> String {
+        let inner = self.inner.lock().expect("store lock poisoned");
+        inner
+            .conversations
+            .get(&message.conversation_id)
+            .filter(|conversation| {
+                conversation_matches_tenant(conversation, &message.project_id, &message.company_id)
+                    && conversation.conversation_type == "direct"
+            })
+            .and_then(|conversation| conversation.phone_number.as_deref())
+            .map(phone_to_jid)
+            .unwrap_or_else(|| message.conversation_id.clone())
     }
 
     pub async fn handle_whatsapp_event(&self, runtime: ChannelRuntime, event: WhatsappEvent) {
@@ -9611,6 +9625,44 @@ mod tests {
         assert_eq!(state.channel("ch")["status"], "disconnected");
         assert_eq!(state.channel_connected_at("ch"), None);
         assert_eq!(state.qr("ch").status, "disconnected");
+    }
+
+    #[test]
+    fn outbound_send_target_prefers_phone_jid_for_lid_direct_conversation() {
+        let state = AppState::new(AppConfig::from_env());
+        state
+            .create_channel("p", "c", Some("ch".to_string()), None, None)
+            .unwrap();
+        state.receive_inbound_text(
+            "p",
+            "c",
+            SimulateInboundTextRequest {
+                conversation_id: Some("241570603368695@lid".to_string()),
+                channel_id: Some("ch".to_string()),
+                from_phone_e164: Some("+5519993810641".to_string()),
+                sender_name: Some("Cliente".to_string()),
+                profile_picture_url: None,
+                text: "oi".to_string(),
+            },
+        );
+        let request = SendMessageRequest {
+            message_type: "text".to_string(),
+            text: Some("resposta".to_string()),
+            media_id: None,
+            caption: None,
+            filename: None,
+            quoted_message_id: None,
+            metadata: None,
+        };
+        let outcome = state
+            .prepare_send_message("p", "c", "241570603368695@lid", "send-lid", request)
+            .unwrap();
+
+        assert_eq!(outcome.message.conversation_id, "241570603368695@lid");
+        assert_eq!(
+            state.outbound_send_target_jid(&outcome.message),
+            "5519993810641@s.whatsapp.net"
+        );
     }
 
     #[test]
