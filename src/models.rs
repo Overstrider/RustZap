@@ -317,6 +317,8 @@ pub struct Conversation {
     pub display_phone: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phone_number: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_picture_media_id: Option<String>,
     pub avatar_url: Option<String>,
     pub profile_picture_url: Option<String>,
     pub last_seq: i64,

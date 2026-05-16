@@ -33,6 +33,11 @@ pub fn sniff_mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
         Some("image/png")
     } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
         Some("image/jpeg")
+    } else if bytes.len() >= 12
+        && bytes.get(0..4) == Some(b"RIFF")
+        && bytes.get(8..12) == Some(b"WEBP")
+    {
+        Some("image/webp")
     } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
         Some("image/gif")
     } else if bytes.starts_with(b"%PDF-") {
