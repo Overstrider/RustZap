@@ -2336,6 +2336,12 @@ impl AppState {
     }
 
     fn outbound_send_target_jid(&self, message: &Message) -> String {
+        if message.conversation_id.ends_with("@lid")
+            || message.conversation_id.ends_with("@s.whatsapp.net")
+            || message.conversation_id.ends_with("@g.us")
+        {
+            return message.conversation_id.clone();
+        }
         let inner = self.inner.lock().expect("store lock poisoned");
         inner
             .conversations
@@ -10136,7 +10142,7 @@ mod tests {
     }
 
     #[test]
-    fn outbound_send_target_prefers_phone_jid_for_lid_direct_conversation() {
+    fn outbound_send_target_preserves_lid_chat_jid_for_lid_direct_conversation() {
         let state = AppState::new(AppConfig::from_env());
         state
             .create_channel("p", "c", Some("ch".to_string()), None, None)
@@ -10169,7 +10175,7 @@ mod tests {
         assert_eq!(outcome.message.conversation_id, "241570603368695@lid");
         assert_eq!(
             state.outbound_send_target_jid(&outcome.message),
-            "5519993810641@s.whatsapp.net"
+            "241570603368695@lid"
         );
     }
 
