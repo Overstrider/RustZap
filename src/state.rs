@@ -2248,6 +2248,16 @@ impl AppState {
             );
         }
         let send_target_jid = self.outbound_send_target_jid(&outcome.message);
+        tracing::debug!(
+            channel_id,
+            conversation_id = %redact_jid_for_log(
+                &outcome.message.conversation_id,
+                self.config.log_redact_phone,
+            ),
+            send_target_jid = %redact_jid_for_log(&send_target_jid, self.config.log_redact_phone),
+            message_type = outcome.message.message_type,
+            "dispatching outbound WhatsApp message"
+        );
         let send_result = if let Some(media_id) = outcome.message.media_id.as_deref() {
             let (media, bytes) = match self.media_blob(media_id).await {
                 Ok(Some(blob)) => blob,
@@ -2336,23 +2346,31 @@ impl AppState {
     }
 
     fn outbound_send_target_jid(&self, message: &Message) -> String {
-        if message.conversation_id.ends_with("@lid")
-            || message.conversation_id.ends_with("@s.whatsapp.net")
-            || message.conversation_id.ends_with("@g.us")
-        {
+        if message.conversation_id.ends_with("@g.us") {
             return message.conversation_id.clone();
         }
         let inner = self.inner.lock().expect("store lock poisoned");
-        inner
-            .conversations
-            .get(&message.conversation_id)
-            .filter(|conversation| {
-                conversation_matches_tenant(conversation, &message.project_id, &message.company_id)
-                    && conversation.conversation_type == "direct"
-            })
-            .and_then(|conversation| conversation.phone_number.as_deref())
-            .map(phone_to_jid)
-            .unwrap_or_else(|| message.conversation_id.clone())
+        if let Some(conversation) =
+            inner
+                .conversations
+                .get(&message.conversation_id)
+                .filter(|conversation| {
+                    conversation_matches_tenant(
+                        conversation,
+                        &message.project_id,
+                        &message.company_id,
+                    )
+                })
+        {
+            if conversation.conversation_type == "group" {
+                return conversation.id.clone();
+            }
+            if let Some(phone_number) = conversation_phone_number_for_inner(&inner, conversation) {
+                return phone_to_jid(&phone_number);
+            }
+        }
+
+        message.conversation_id.clone()
     }
 
     pub async fn handle_whatsapp_event(&self, runtime: ChannelRuntime, event: WhatsappEvent) {
@@ -7968,6 +7986,27 @@ fn phone_to_jid(phone_e164: &str) -> String {
     }
 }
 
+fn redact_jid_for_log(jid: &str, redact_phone: bool) -> String {
+    if !redact_phone {
+        return jid.to_string();
+    }
+
+    let (local, domain) = jid.split_once('@').unwrap_or((jid, ""));
+    let suffix: String = local
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if domain.is_empty() {
+        format!("***{suffix}")
+    } else {
+        format!("***{suffix}@{domain}")
+    }
+}
+
 fn phone_number_from_value(value: &str) -> Option<String> {
     let digits: String = value.chars().filter(|ch| ch.is_ascii_digit()).collect();
     (!digits.is_empty()).then_some(digits)
@@ -10142,7 +10181,7 @@ mod tests {
     }
 
     #[test]
-    fn outbound_send_target_preserves_lid_chat_jid_for_lid_direct_conversation() {
+    fn outbound_lid_direct_send_prefers_phone_jid_when_phone_is_known() {
         let state = AppState::new(AppConfig::from_env());
         state
             .create_channel("p", "c", Some("ch".to_string()), None, None)
@@ -10175,7 +10214,89 @@ mod tests {
         assert_eq!(outcome.message.conversation_id, "241570603368695@lid");
         assert_eq!(
             state.outbound_send_target_jid(&outcome.message),
+            "5519993810641@s.whatsapp.net"
+        );
+    }
+
+    #[test]
+    fn outbound_lid_direct_send_preserves_lid_when_phone_is_unknown() {
+        let state = AppState::new(AppConfig::from_env());
+        state
+            .create_channel("p", "c", Some("ch".to_string()), None, None)
+            .unwrap();
+        state.receive_inbound_text(
+            "p",
+            "c",
+            SimulateInboundTextRequest {
+                conversation_id: Some("241570603368695@lid".to_string()),
+                channel_id: Some("ch".to_string()),
+                from_phone_e164: None,
+                sender_name: Some("Cliente".to_string()),
+                profile_picture_url: None,
+                text: "oi".to_string(),
+            },
+        );
+        let request = SendMessageRequest {
+            message_type: "text".to_string(),
+            text: Some("resposta".to_string()),
+            media_id: None,
+            caption: None,
+            filename: None,
+            quoted_message_id: None,
+            metadata: None,
+        };
+        let outcome = state
+            .prepare_send_message(
+                "p",
+                "c",
+                "241570603368695@lid",
+                "send-lid-no-phone",
+                request,
+            )
+            .unwrap();
+
+        assert_eq!(outcome.message.conversation_id, "241570603368695@lid");
+        assert_eq!(
+            state.outbound_send_target_jid(&outcome.message),
             "241570603368695@lid"
+        );
+    }
+
+    #[test]
+    fn outbound_group_send_preserves_group_jid() {
+        let state = AppState::new(AppConfig::from_env());
+        state
+            .create_channel("p", "c", Some("ch".to_string()), None, None)
+            .unwrap();
+        state.receive_inbound_text(
+            "p",
+            "c",
+            SimulateInboundTextRequest {
+                conversation_id: Some("120363000000000000@g.us".to_string()),
+                channel_id: Some("ch".to_string()),
+                from_phone_e164: None,
+                sender_name: Some("Grupo".to_string()),
+                profile_picture_url: None,
+                text: "oi".to_string(),
+            },
+        );
+        let request = SendMessageRequest {
+            message_type: "text".to_string(),
+            text: Some("resposta".to_string()),
+            media_id: None,
+            caption: None,
+            filename: None,
+            quoted_message_id: None,
+            metadata: None,
+        };
+        let outcome = state
+            .prepare_send_message("p", "c", "120363000000000000@g.us", "send-group", request)
+            .unwrap();
+
+        assert_eq!(outcome.message.conversation_id, "120363000000000000@g.us");
+        assert_eq!(
+            state.outbound_send_target_jid(&outcome.message),
+            "120363000000000000@g.us"
         );
     }
 
