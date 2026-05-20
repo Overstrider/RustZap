@@ -589,6 +589,48 @@ fn decorate_openapi_contract(spec: &mut Value) {
         );
     }
 
+    if let Some(upload) = paths
+        .get_mut("/v1/companies/{company_id}/media/upload-outbound")
+        .and_then(Value::as_object_mut)
+    {
+        upload.insert(
+            "post".to_string(),
+            json!({
+                "summary": "Upload outbound media idempotently",
+                "parameters": [
+                    path_parameter("company_id"),
+                    idempotency_header_parameter()
+                ],
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "multipart/form-data": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["conversation_id", "file"],
+                                "properties": {
+                                    "conversation_id": {"type": "string"},
+                                    "media_type": {"type": "string"},
+                                    "type": {"type": "string"},
+                                    "mime_type": {"type": "string"},
+                                    "filename": {"type": "string"},
+                                    "caption": {"type": "string"},
+                                    "file": {"type": "string", "format": "binary"}
+                                }
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "200": ok_response("Uploaded media", None),
+                    "409": error_response("Idempotency conflict"),
+                    "413": error_response("Payload too large"),
+                    "default": error_response("Standard error envelope")
+                }
+            }),
+        );
+    }
+
     if let Some(dirty) = paths
         .get_mut("/v1/companies/{company_id}/dirty-conversations")
         .and_then(Value::as_object_mut)
@@ -2006,6 +2048,7 @@ async fn upload_outbound(
             .rate_limits
             .media_downloads_per_minute_per_channel,
     })?;
+    let idempotency_key = idempotency_key(&headers)?;
     let mut conversation_id = None;
     let mut media_type = None;
     let mut mime_type = None;
@@ -2021,60 +2064,40 @@ async fn upload_outbound(
         match name.as_str() {
             "conversation_id" => {
                 conversation_id = Some(
-                    field
-                        .text()
-                        .await
-                        .map_err(|err| {
-                            ApiError::BadRequest(format!("invalid conversation_id field: {err}"))
-                        })?
+                    read_multipart_text_limit(field, 8 * 1024, "conversation_id")
+                        .await?
                         .trim()
                         .to_string(),
                 );
             }
             "type" | "media_type" => {
                 media_type = Some(
-                    field
-                        .text()
-                        .await
-                        .map_err(|err| {
-                            ApiError::BadRequest(format!("invalid media type field: {err}"))
-                        })?
+                    read_multipart_text_limit(field, 8 * 1024, "media type")
+                        .await?
                         .trim()
                         .to_string(),
                 );
             }
             "mime_type" => {
                 mime_type = Some(
-                    field
-                        .text()
-                        .await
-                        .map_err(|err| {
-                            ApiError::BadRequest(format!("invalid mime_type field: {err}"))
-                        })?
+                    read_multipart_text_limit(field, 8 * 1024, "mime_type")
+                        .await?
                         .trim()
                         .to_string(),
                 );
             }
             "filename" => {
                 filename = Some(
-                    field
-                        .text()
-                        .await
-                        .map_err(|err| {
-                            ApiError::BadRequest(format!("invalid filename field: {err}"))
-                        })?
+                    read_multipart_text_limit(field, 8 * 1024, "filename")
+                        .await?
                         .trim()
                         .to_string(),
                 );
             }
             "caption" => {
                 caption = Some(
-                    field
-                        .text()
-                        .await
-                        .map_err(|err| {
-                            ApiError::BadRequest(format!("invalid caption field: {err}"))
-                        })?
+                    read_multipart_text_limit(field, 8 * 1024, "caption")
+                        .await?
                         .trim()
                         .to_string(),
                 );
@@ -2086,23 +2109,19 @@ async fn upload_outbound(
                 if mime_type.is_none() {
                     mime_type = field.content_type().map(str::to_string);
                 }
-                file_bytes = Some(
-                    field
-                        .bytes()
-                        .await
-                        .map_err(|err| {
-                            ApiError::BadRequest(format!("invalid upload file bytes: {err}"))
-                        })?
-                        .to_vec(),
-                );
+                let max_upload_bytes =
+                    media_reject_limit_bytes(state.config.media_reject_threshold_mb)?;
+                file_bytes =
+                    Some(read_multipart_bytes_limit(field, max_upload_bytes, "upload file").await?);
             }
             _ => {}
         }
     }
     let media = state
-        .upload_outbound_media(
+        .upload_outbound_media_idempotent(
             &path.project_id,
             &path.company_id,
+            &idempotency_key,
             OutboundMediaUpload {
                 conversation_id: conversation_id.ok_or_else(|| {
                     ApiError::BadRequest("conversation_id is required".to_string())
@@ -2117,6 +2136,46 @@ async fn upload_outbound(
         )
         .await?;
     Ok(Json(json!(media)))
+}
+
+fn media_reject_limit_bytes(limit_mb: u64) -> ApiResult<usize> {
+    let bytes = limit_mb
+        .checked_mul(1024)
+        .and_then(|value| value.checked_mul(1024))
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| ApiError::Internal("media reject threshold is too large".to_string()))?;
+    Ok(bytes)
+}
+
+async fn read_multipart_text_limit(
+    field: axum::extract::multipart::Field<'_>,
+    limit: usize,
+    label: &str,
+) -> ApiResult<String> {
+    let bytes = read_multipart_bytes_limit(field, limit, label).await?;
+    String::from_utf8(bytes)
+        .map_err(|err| ApiError::BadRequest(format!("invalid {label} field utf8: {err}")))
+}
+
+async fn read_multipart_bytes_limit(
+    mut field: axum::extract::multipart::Field<'_>,
+    limit: usize,
+    label: &str,
+) -> ApiResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|err| ApiError::BadRequest(format!("invalid {label} bytes: {err}")))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > limit {
+            return Err(ApiError::PayloadTooLarge(format!(
+                "{label} is larger than {limit} bytes"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 async fn get_media(
@@ -3505,6 +3564,25 @@ mod tests {
         );
         assert!(messages["post"]["responses"].get("202").is_some());
         assert!(messages["post"]["responses"].get("409").is_some());
+
+        let upload = &spec["paths"]["/v1/companies/{company_id}/media/upload-outbound"]["post"];
+        let upload_parameters = upload["parameters"].as_array().unwrap();
+        assert!(upload_parameters.iter().any(|parameter| {
+            parameter["name"] == "Idempotency-Key"
+                && parameter["in"] == "header"
+                && parameter["required"] == true
+        }));
+        let upload_schema = &upload["requestBody"]["content"]["multipart/form-data"]["schema"];
+        assert_eq!(
+            upload_schema["required"],
+            json!(["conversation_id", "file"])
+        );
+        assert_eq!(
+            upload_schema["properties"]["file"],
+            json!({"type": "string", "format": "binary"})
+        );
+        assert!(upload["responses"].get("409").is_some());
+        assert!(upload["responses"].get("413").is_some());
 
         let dirty = &spec["paths"]["/v1/companies/{company_id}/dirty-conversations"];
         assert!(dirty["get"]["parameters"].as_array().unwrap().iter().any(

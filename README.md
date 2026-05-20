@@ -809,7 +809,9 @@ If `emoji` is omitted, the route defaults to thumbs-up.
 | GET | `/v1/companies/{company_id}/media/{media_id}/download-url` | Get R2/public/dev URL |
 | POST | `/v1/companies/{company_id}/media/{media_id}/save` | Save media permanently for an entity |
 
-Outbound upload is `multipart/form-data`.
+Outbound upload is `multipart/form-data` and requires `Idempotency-Key`.
+Retrying the same key with the same body returns the same media; retrying with a
+different body returns an idempotency conflict.
 
 Fields:
 
@@ -824,6 +826,7 @@ Example:
 
 ```bash
 curl -X POST \
+  -H 'Idempotency-Key: upload-media-0001' \
   -F 'conversation_id=5511999999999' \
   -F 'type=document' \
   -F 'caption=Segue o documento.' \
@@ -1284,6 +1287,7 @@ Upload:
 
 ```bash
 curl -X POST \
+  -H 'Idempotency-Key: company_123-upload-doc-0001' \
   -F 'conversation_id=5511999999999' \
   -F 'type=document' \
   -F 'caption=Contrato' \
