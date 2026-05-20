@@ -275,6 +275,8 @@ struct StoreInner {
     messages_by_conversation: HashMap<String, Vec<Message>>,
     messages_by_id: HashMap<String, Message>,
     idempotency: HashMap<(String, String, String), IdempotencyRecord>,
+    media_upload_idempotency: HashMap<(String, String, String), MediaUploadIdempotencyRecord>,
+    media_upload_idempotency_inflight: HashMap<(String, String, String), String>,
     dirty: HashMap<(String, String, String), DirtyRecord>,
     dirty_leases: HashMap<(String, String, String, String), DirtyLeaseRecord>,
     consumer_state: HashMap<(String, String, String, String), i64>,
@@ -303,6 +305,8 @@ pub(crate) struct PersistedStore {
     pub(crate) messages_by_conversation: HashMap<String, Vec<Message>>,
     pub(crate) messages_by_id: HashMap<String, Message>,
     pub(crate) idempotency: Vec<((String, String, String), IdempotencyRecord)>,
+    pub(crate) media_upload_idempotency:
+        Vec<((String, String, String), MediaUploadIdempotencyRecord)>,
     pub(crate) dirty: Vec<((String, String, String), DirtyRecord)>,
     pub(crate) dirty_leases: Vec<((String, String, String, String), DirtyLeaseRecord)>,
     pub(crate) consumer_state: Vec<((String, String, String, String), i64)>,
@@ -337,6 +341,11 @@ impl PersistedStore {
             messages_by_id: inner.messages_by_id.clone(),
             idempotency: inner
                 .idempotency
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            media_upload_idempotency: inner
+                .media_upload_idempotency
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
@@ -382,6 +391,8 @@ impl PersistedStore {
             messages_by_conversation: store.messages_by_conversation,
             messages_by_id: store.messages_by_id,
             idempotency: store.idempotency.into_iter().collect(),
+            media_upload_idempotency: store.media_upload_idempotency.into_iter().collect(),
+            media_upload_idempotency_inflight: HashMap::new(),
             dirty: store.dirty.into_iter().collect(),
             dirty_leases: store.dirty_leases.into_iter().collect(),
             consumer_state: store.consumer_state.into_iter().collect(),
@@ -493,6 +504,9 @@ fn sanitize_updates_surfaces(mut store: PersistedStore) -> PersistedStore {
                 && !is_updates_surface_jid(conversation_id)
                 && !removed_message_ids.contains(&record.message_id)
         });
+    store
+        .media_upload_idempotency
+        .retain(|(_, record)| store.media.contains_key(&record.media_id));
     store
         .dirty
         .retain(|((_, _, conversation_id), _)| !disallowed_conversations.contains(conversation_id));
@@ -690,6 +704,51 @@ fn contact_profile_refresh_due(contact: &ContactRecord, now: OffsetDateTime, for
 pub(crate) struct IdempotencyRecord {
     pub(crate) request_hash: String,
     pub(crate) message_id: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct MediaUploadIdempotencyRecord {
+    pub(crate) request_hash: String,
+    pub(crate) media_id: String,
+}
+
+struct MediaUploadInflightGuard {
+    state: AppState,
+    key: (String, String, String),
+    request_hash: String,
+    active: bool,
+}
+
+impl MediaUploadInflightGuard {
+    fn new(state: AppState, key: (String, String, String), request_hash: String) -> Self {
+        Self {
+            state,
+            key,
+            request_hash,
+            active: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for MediaUploadInflightGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Ok(mut inner) = self.state.inner.lock() {
+            let should_remove = inner
+                .media_upload_idempotency_inflight
+                .get(&self.key)
+                .is_some_and(|hash| hash == &self.request_hash);
+            if should_remove {
+                inner.media_upload_idempotency_inflight.remove(&self.key);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5227,6 +5286,125 @@ impl AppState {
         Ok(media)
     }
 
+    pub async fn upload_outbound_media_idempotent(
+        &self,
+        project_id: &str,
+        company_id: &str,
+        idempotency_key: &str,
+        upload: OutboundMediaUpload,
+    ) -> ApiResult<MediaObject> {
+        let request_hash = outbound_media_upload_request_hash(&upload)?;
+        let idem_key = (
+            project_id.to_string(),
+            company_id.to_string(),
+            idempotency_key.to_string(),
+        );
+
+        let mut inflight_guard = None;
+        let mut wait_attempts = 0u32;
+        loop {
+            let should_wait = {
+                let mut inner = self.inner.lock().expect("store lock poisoned");
+                if let Some(record) = inner.media_upload_idempotency.get(&idem_key) {
+                    if record.request_hash == request_hash {
+                        return inner.media.get(&record.media_id).cloned().ok_or_else(|| {
+                            ApiError::Internal(format!(
+                                "cached idempotency media {} missing",
+                                record.media_id
+                            ))
+                        });
+                    }
+                    return Err(ApiError::IdempotencyConflict(
+                        "same Idempotency-Key used with different upload body".to_string(),
+                    ));
+                }
+                if let Some(inflight_hash) = inner.media_upload_idempotency_inflight.get(&idem_key)
+                {
+                    if inflight_hash != &request_hash {
+                        return Err(ApiError::IdempotencyConflict(
+                            "same Idempotency-Key used with different upload body".to_string(),
+                        ));
+                    }
+                    true
+                } else {
+                    inner
+                        .media_upload_idempotency_inflight
+                        .insert(idem_key.clone(), request_hash.clone());
+                    inflight_guard = Some(MediaUploadInflightGuard::new(
+                        self.clone(),
+                        idem_key.clone(),
+                        request_hash.clone(),
+                    ));
+                    false
+                }
+            };
+
+            if !should_wait {
+                break;
+            }
+            wait_attempts += 1;
+            if wait_attempts > 12_000 {
+                return Err(ApiError::IdempotencyConflict(
+                    "same Idempotency-Key upload is still in progress".to_string(),
+                ));
+            }
+            tokio::time::sleep(StdDuration::from_millis(10)).await;
+        }
+
+        let media_result = self
+            .upload_outbound_media(project_id, company_id, upload)
+            .await;
+
+        let mut inner = self.inner.lock().expect("store lock poisoned");
+        let media = match media_result {
+            Ok(media) => media,
+            Err(err) => {
+                inner.media_upload_idempotency_inflight.remove(&idem_key);
+                if let Some(guard) = inflight_guard.as_mut() {
+                    guard.disarm();
+                }
+                return Err(err);
+            }
+        };
+
+        if let Some(record) = inner.media_upload_idempotency.get(&idem_key) {
+            let record_hash = record.request_hash.clone();
+            let record_media_id = record.media_id.clone();
+            if record_hash == request_hash {
+                inner.media_upload_idempotency_inflight.remove(&idem_key);
+                if let Some(guard) = inflight_guard.as_mut() {
+                    guard.disarm();
+                }
+                return inner.media.get(&record_media_id).cloned().ok_or_else(|| {
+                    ApiError::Internal(format!(
+                        "cached idempotency media {} missing",
+                        record_media_id
+                    ))
+                });
+            }
+            inner.media_upload_idempotency_inflight.remove(&idem_key);
+            if let Some(guard) = inflight_guard.as_mut() {
+                guard.disarm();
+            }
+            return Err(ApiError::IdempotencyConflict(
+                "same Idempotency-Key used with different upload body".to_string(),
+            ));
+        }
+        inner.media_upload_idempotency.insert(
+            idem_key.clone(),
+            MediaUploadIdempotencyRecord {
+                request_hash,
+                media_id: media.id.clone(),
+            },
+        );
+        inner.media_upload_idempotency_inflight.remove(&idem_key);
+        if let Some(guard) = inflight_guard.as_mut() {
+            guard.disarm();
+        }
+        self.persist_locked(&inner);
+        Ok(media)
+    }
+
     fn stage_media_bytes(&self, media_id: &str, bytes: &[u8]) -> ApiResult<PathBuf> {
         let preferred_dir = self.config.media_local_temp_dir.join("staging");
         let staging_dir = if let Err(err) = std::fs::create_dir_all(&preferred_dir) {
@@ -8074,6 +8252,18 @@ fn group_subject_for_jid(jid: &str) -> String {
     format!("Grupo {short}")
 }
 
+fn outbound_media_upload_request_hash(upload: &OutboundMediaUpload) -> ApiResult<String> {
+    let bytes_sha256 = hex::encode(Sha256::digest(&upload.bytes));
+    sha256_json(&json!({
+        "conversation_id": upload.conversation_id,
+        "media_type": upload.media_type,
+        "mime_type": upload.mime_type,
+        "filename": upload.filename,
+        "caption": upload.caption,
+        "bytes_sha256": bytes_sha256,
+    }))
+}
+
 fn normalize_media_type(value: &str) -> ApiResult<String> {
     let normalized = value.trim().to_ascii_lowercase();
     match normalized.as_str() {
@@ -8699,6 +8889,15 @@ mod tests {
         config.local_storage_dir = dir.clone();
         config.dev_mode = true;
         (AppState::new(config), dir)
+    }
+
+    fn local_media_config(name: &str) -> AppConfig {
+        let mut config = AppConfig::from_env();
+        let unique = Uuid::now_v7().simple();
+        config.storage_provider = StorageProvider::LocalFs;
+        config.local_storage_dir = std::env::temp_dir().join(format!("{name}-{unique}"));
+        config.media_local_temp_dir = std::env::temp_dir().join(format!("{name}-tmp-{unique}"));
+        config
     }
 
     #[test]
@@ -9596,7 +9795,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbound_upload_creates_placeholder_conversation_for_new_jid() {
-        let state = AppState::new(AppConfig::from_env());
+        let state = AppState::new(local_media_config("outbound-placeholder"));
         let conversation_id = "5511888777666@s.whatsapp.net";
         let bytes = b"rustzap outbound bytes".to_vec();
 
@@ -9622,6 +9821,92 @@ mod tests {
         assert_eq!(conversation.last_seq, 0);
         assert_eq!(media.conversation_id, conversation_id);
         assert_eq!(media.sha256, hex::encode(Sha256::digest(&bytes)));
+    }
+
+    #[tokio::test]
+    async fn outbound_upload_idempotency_reuses_same_media_for_retry() {
+        let state = AppState::new(local_media_config("outbound-idempotency"));
+        let upload = || OutboundMediaUpload {
+            conversation_id: "conv_upload_retry".to_string(),
+            media_type: Some("document".to_string()),
+            mime_type: Some("text/plain".to_string()),
+            filename: Some("arquivo.txt".to_string()),
+            caption: None,
+            bytes: b"same retry bytes".to_vec(),
+        };
+
+        let first = state
+            .upload_outbound_media_idempotent("p", "c", "idem-upload-1", upload())
+            .await
+            .unwrap();
+        let retry = state
+            .upload_outbound_media_idempotent("p", "c", "idem-upload-1", upload())
+            .await
+            .unwrap();
+
+        assert_eq!(retry.id, first.id);
+        assert_eq!(
+            state.media_blob(&first.id).await.unwrap().unwrap().1,
+            b"same retry bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_upload_idempotency_rejects_different_retry_body() {
+        let state = AppState::new(local_media_config("outbound-idempotency-conflict"));
+        let mut upload = OutboundMediaUpload {
+            conversation_id: "conv_upload_retry_conflict".to_string(),
+            media_type: Some("document".to_string()),
+            mime_type: Some("text/plain".to_string()),
+            filename: Some("arquivo.txt".to_string()),
+            caption: None,
+            bytes: b"first bytes".to_vec(),
+        };
+
+        state
+            .upload_outbound_media_idempotent("p", "c", "idem-upload-2", upload.clone())
+            .await
+            .unwrap();
+        upload.bytes = b"different bytes".to_vec();
+
+        let err = state
+            .upload_outbound_media_idempotent("p", "c", "idem-upload-2", upload)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ApiError::IdempotencyConflict(_)));
+    }
+
+    #[tokio::test]
+    async fn outbound_upload_idempotency_serializes_concurrent_same_key() {
+        let state = AppState::new(local_media_config("outbound-idempotency-concurrent"));
+        let upload = || OutboundMediaUpload {
+            conversation_id: "conv_upload_retry_concurrent".to_string(),
+            media_type: Some("document".to_string()),
+            mime_type: Some("text/plain".to_string()),
+            filename: Some("arquivo.txt".to_string()),
+            caption: None,
+            bytes: vec![b'x'; 512 * 1024],
+        };
+
+        let (first, second, third) = tokio::join!(
+            state.upload_outbound_media_idempotent("p", "c", "idem-upload-3", upload()),
+            state.upload_outbound_media_idempotent("p", "c", "idem-upload-3", upload()),
+            state.upload_outbound_media_idempotent("p", "c", "idem-upload-3", upload()),
+        );
+
+        let first = first.unwrap();
+        let second = second.unwrap();
+        let third = third.unwrap();
+
+        assert_eq!(second.id, first.id);
+        assert_eq!(third.id, first.id);
+        assert_eq!(
+            state
+                .media_for_conversation("conv_upload_retry_concurrent")
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
