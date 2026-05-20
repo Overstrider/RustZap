@@ -3303,11 +3303,17 @@ impl AppState {
                         contact_id: &contact_id,
                         push_name: push_name.as_deref(),
                         profile,
+                        profile_lookup_succeeded: true,
                     });
                 }
                 Err(err) => {
                     if let Some(profile) = contact_profile_from_alt(&contact_id, alt_jid.as_deref())
                     {
+                        state.record_contact_profile_lookup_failure(
+                            &project_id,
+                            &company_id,
+                            &contact_id,
+                        );
                         state.apply_contact_profile(ContactProfileApplyInput {
                             project_id: &project_id,
                             company_id: &company_id,
@@ -3316,6 +3322,7 @@ impl AppState {
                             contact_id: &contact_id,
                             push_name: push_name.as_deref(),
                             profile,
+                            profile_lookup_succeeded: false,
                         });
                     } else {
                         state.record_contact_profile_lookup_failure(
@@ -3401,6 +3408,7 @@ impl AppState {
                 push_name: input.push_name,
                 profile: &input.profile,
                 now,
+                profile_lookup_succeeded: input.profile_lookup_succeeded,
             },
         );
         let aliases = contact_aliases(&contact, &input.profile);
@@ -3850,6 +3858,7 @@ impl AppState {
                         contact_id,
                         push_name: context.push_name.as_deref(),
                         profile,
+                        profile_lookup_succeeded: true,
                     });
                 }
                 Err(err) => {
@@ -7200,6 +7209,7 @@ struct ContactProfileApplyInput<'a> {
     contact_id: &'a str,
     push_name: Option<&'a str>,
     profile: ContactProfile,
+    profile_lookup_succeeded: bool,
 }
 
 struct ContactUpsertInput<'a> {
@@ -7225,6 +7235,7 @@ struct ContactEnrichmentInput<'a> {
     push_name: Option<&'a str>,
     profile: &'a ContactProfile,
     now: OffsetDateTime,
+    profile_lookup_succeeded: bool,
 }
 
 fn upsert_contact_inner(inner: &mut StoreInner, input: ContactUpsertInput<'_>) -> ContactRecord {
@@ -7303,6 +7314,7 @@ fn upsert_contact_with_alt_inner(
                 push_name: input.contact.push_name,
                 profile: &profile,
                 now: input.contact.now,
+                profile_lookup_succeeded: false,
             },
         )
     } else {
@@ -7407,9 +7419,11 @@ fn enrich_contact_inner(
             entry.avatar_url = Some(profile_picture_url.clone());
             entry.profile_picture_url = Some(profile_picture_url);
         }
-        entry.profile_lookup_attempted_at = Some(input.now);
-        entry.profile_lookup_failed_at = None;
-        entry.profile_lookup_failure_count = 0;
+        if input.profile_lookup_succeeded {
+            entry.profile_lookup_attempted_at = Some(input.now);
+            entry.profile_lookup_failed_at = None;
+            entry.profile_lookup_failure_count = 0;
+        }
         if let Some(description) = input
             .profile
             .business_description
@@ -10131,6 +10145,7 @@ mod tests {
                 profile_picture_id: Some("pic_1".to_string()),
                 profile_picture_url: Some("https://example.test/profile.jpg".to_string()),
             },
+            profile_lookup_succeeded: true,
         });
 
         let conversation = state.conversations("p", "c").remove(0);
@@ -10198,6 +10213,7 @@ mod tests {
                 profile_picture_id: Some("pic_contact".to_string()),
                 profile_picture_url: Some("https://example.test/contact.jpg".to_string()),
             },
+            profile_lookup_succeeded: true,
         });
 
         let contact = state.contact("p", "c", contact_id).unwrap();
@@ -10242,6 +10258,7 @@ mod tests {
                 profile_picture_id: Some("pic_sender".to_string()),
                 profile_picture_url: Some("https://example.test/sender.jpg".to_string()),
             },
+            profile_lookup_succeeded: true,
         });
 
         let conversation = state.conversations("p", "c").remove(0);
@@ -10776,6 +10793,42 @@ mod tests {
         contact.profile_lookup_failed_at = Some(now - Duration::minutes(31));
 
         assert!(contact_profile_refresh_due(&contact, now, false));
+    }
+
+    #[test]
+    fn alias_contact_upsert_does_not_reserve_profile_lookup() {
+        let mut inner = StoreInner::default();
+        let now = OffsetDateTime::now_utc();
+        let lid = "200889293889773@lid";
+        let phone_jid = "5511999999999@s.whatsapp.net";
+
+        upsert_contact_with_alt_inner(
+            &mut inner,
+            ContactUpsertWithAltInput {
+                contact: ContactUpsertInput {
+                    project_id: "p",
+                    company_id: "c",
+                    channel_id: Some("ch"),
+                    contact_id: lid,
+                    push_name: Some("Pessoa"),
+                    profile_picture_url: None,
+                    now,
+                },
+                alt_jid: Some(phone_jid),
+            },
+        );
+
+        let lid_contact = inner.contacts.get(lid).unwrap();
+        assert_eq!(lid_contact.canonical_jid.as_deref(), Some(phone_jid));
+        assert_eq!(lid_contact.profile_lookup_attempted_at, None);
+        assert_eq!(lid_contact.profile_lookup_failed_at, None);
+        assert_eq!(lid_contact.profile_lookup_failure_count, 0);
+
+        let phone_contact = inner.contacts.get(phone_jid).unwrap();
+        assert_eq!(phone_contact.lid.as_deref(), Some(lid));
+        assert_eq!(phone_contact.profile_lookup_attempted_at, None);
+        assert_eq!(phone_contact.profile_lookup_failed_at, None);
+        assert_eq!(phone_contact.profile_lookup_failure_count, 0);
     }
 
     #[test]
