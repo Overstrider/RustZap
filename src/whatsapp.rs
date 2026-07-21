@@ -216,11 +216,46 @@ pub struct InboundMediaDescriptor {
 #[derive(Clone, Default)]
 pub struct WhatsappManager {
     supervisors: Arc<Mutex<HashMap<String, ChannelSupervisor>>>,
+    intents: Arc<Mutex<HashMap<String, ReconnectIntent>>>,
 }
 
 struct ChannelSupervisor {
     client: Arc<Client>,
     task: Arc<tokio::task::JoinHandle<()>>,
+}
+
+/// Per-channel reconnection bookkeeping. `desired` distinguishes an operator
+/// connect (keep the channel up, respawn on runtime death) from an explicit
+/// disconnect or a WhatsApp logout (stay down). `needs_session_reset` marks
+/// credentials invalidated by a LoggedOut event: the session sqlite must be
+/// wiped before the next pairing attempt or the client re-loads the dead
+/// credentials and is immediately logged out again.
+#[derive(Default, Clone)]
+struct ReconnectIntent {
+    desired: bool,
+    needs_session_reset: bool,
+    attempts: u32,
+}
+
+const RECONNECT_BASE_DELAY_SECS: u64 = 5;
+const RECONNECT_MAX_DELAY_SECS: u64 = 300;
+
+/// Removes the session sqlite (plus -shm/-wal sidecars) for a channel so the
+/// next connect performs a fresh QR pairing instead of resuming dead
+/// credentials.
+pub fn wipe_session_files(session_path: &std::path::Path) {
+    for suffix in ["", "-shm", "-wal"] {
+        let mut os_path = session_path.as_os_str().to_owned();
+        os_path.push(suffix);
+        let path = PathBuf::from(os_path);
+        match fs::remove_file(&path) {
+            Ok(()) => tracing::info!(path = %path.display(), "removed WhatsApp session file"),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(path = %path.display(), %err, "failed to remove WhatsApp session file");
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +302,65 @@ pub enum WhatsappEvent {
 }
 
 impl WhatsappManager {
+    pub fn set_desired(&self, channel_id: &str, desired: bool) {
+        self.intents
+            .lock()
+            .expect("whatsapp intents lock poisoned")
+            .entry(channel_id.to_string())
+            .or_default()
+            .desired = desired;
+    }
+
+    pub fn is_desired(&self, channel_id: &str) -> bool {
+        self.intents
+            .lock()
+            .expect("whatsapp intents lock poisoned")
+            .get(channel_id)
+            .is_some_and(|intent| intent.desired)
+    }
+
+    pub fn mark_needs_session_reset(&self, channel_id: &str) {
+        self.intents
+            .lock()
+            .expect("whatsapp intents lock poisoned")
+            .entry(channel_id.to_string())
+            .or_default()
+            .needs_session_reset = true;
+    }
+
+    /// Returns and clears the pending session-reset flag for the channel.
+    pub fn take_needs_session_reset(&self, channel_id: &str) -> bool {
+        let mut intents = self.intents.lock().expect("whatsapp intents lock poisoned");
+        match intents.get_mut(channel_id) {
+            Some(intent) if intent.needs_session_reset => {
+                intent.needs_session_reset = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Increments the retry counter and returns the delay to wait before the
+    /// next reconnect attempt: 5s doubling up to a 300s ceiling.
+    pub fn next_reconnect_delay_secs(&self, channel_id: &str) -> u64 {
+        let mut intents = self.intents.lock().expect("whatsapp intents lock poisoned");
+        let intent = intents.entry(channel_id.to_string()).or_default();
+        let attempt = intent.attempts.min(16);
+        intent.attempts = intent.attempts.saturating_add(1);
+        (RECONNECT_BASE_DELAY_SECS << attempt).min(RECONNECT_MAX_DELAY_SECS)
+    }
+
+    pub fn reset_reconnect_backoff(&self, channel_id: &str) {
+        if let Some(intent) = self
+            .intents
+            .lock()
+            .expect("whatsapp intents lock poisoned")
+            .get_mut(channel_id)
+        {
+            intent.attempts = 0;
+        }
+    }
+
     pub fn is_channel_active(&self, channel_id: &str) -> bool {
         self.supervisors
             .lock()
@@ -1099,6 +1193,68 @@ mod tests {
 
         assert!(!manager.is_channel_active("ch"));
         assert!(!manager.is_channel_connected("ch"));
+    }
+
+    #[test]
+    fn reconnect_delay_doubles_and_caps_at_max() {
+        let manager = WhatsappManager::default();
+
+        assert_eq!(manager.next_reconnect_delay_secs("ch"), 5);
+        assert_eq!(manager.next_reconnect_delay_secs("ch"), 10);
+        assert_eq!(manager.next_reconnect_delay_secs("ch"), 20);
+        assert_eq!(manager.next_reconnect_delay_secs("ch"), 40);
+        assert_eq!(manager.next_reconnect_delay_secs("ch"), 80);
+        assert_eq!(manager.next_reconnect_delay_secs("ch"), 160);
+        assert_eq!(manager.next_reconnect_delay_secs("ch"), 300);
+        assert_eq!(manager.next_reconnect_delay_secs("ch"), 300);
+
+        manager.reset_reconnect_backoff("ch");
+        assert_eq!(manager.next_reconnect_delay_secs("ch"), 5);
+    }
+
+    #[test]
+    fn desired_flag_tracks_connect_intent() {
+        let manager = WhatsappManager::default();
+
+        assert!(!manager.is_desired("ch"));
+        manager.set_desired("ch", true);
+        assert!(manager.is_desired("ch"));
+        manager.set_desired("ch", false);
+        assert!(!manager.is_desired("ch"));
+    }
+
+    #[test]
+    fn session_reset_flag_is_consumed_once() {
+        let manager = WhatsappManager::default();
+
+        assert!(!manager.take_needs_session_reset("ch"));
+        manager.mark_needs_session_reset("ch");
+        assert!(manager.take_needs_session_reset("ch"));
+        assert!(!manager.take_needs_session_reset("ch"));
+    }
+
+    #[test]
+    fn wipe_session_files_removes_sqlite_and_sidecars() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustzap-wipe-test-{}",
+            uuid::Uuid::now_v7().simple()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let session = dir.join("session.sqlite");
+        for suffix in ["", "-shm", "-wal"] {
+            let mut os_path = session.as_os_str().to_owned();
+            os_path.push(suffix);
+            fs::write(PathBuf::from(os_path), b"x").expect("write session file");
+        }
+
+        wipe_session_files(&session);
+
+        for suffix in ["", "-shm", "-wal"] {
+            let mut os_path = session.as_os_str().to_owned();
+            os_path.push(suffix);
+            assert!(!PathBuf::from(os_path).exists());
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
