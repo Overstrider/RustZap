@@ -19,7 +19,11 @@ use wacore::{
     types::{events::Event, message::MessageInfo, presence::ReceiptType},
 };
 use waproto::whatsapp as wa;
-use whatsapp_rust::{Client, Jid, TokioRuntime, bot::Bot, store::SqliteStore};
+use whatsapp_rust::{
+    Client, Jid, TokioRuntime,
+    bot::{Bot, BotHandle},
+    store::SqliteStore,
+};
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
 
@@ -216,11 +220,78 @@ pub struct InboundMediaDescriptor {
 #[derive(Clone, Default)]
 pub struct WhatsappManager {
     supervisors: Arc<Mutex<HashMap<String, ChannelSupervisor>>>,
+    intents: Arc<Mutex<HashMap<String, ReconnectIntent>>>,
+    start_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 struct ChannelSupervisor {
     client: Arc<Client>,
     task: Arc<tokio::task::JoinHandle<()>>,
+}
+
+struct AbortOnDrop<T> {
+    task: T,
+    abort: fn(&T),
+}
+
+impl<T> AbortOnDrop<T> {
+    fn new(task: T, abort: fn(&T)) -> Self {
+        Self { task, abort }
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        (self.abort)(&self.task);
+    }
+}
+
+impl<T> std::future::Future for AbortOnDrop<T>
+where
+    T: std::future::Future + Unpin,
+{
+    type Output = T::Output;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.task).poll(cx)
+    }
+}
+
+/// Per-channel reconnection bookkeeping. `desired` distinguishes an operator
+/// connect (keep the channel up, respawn on runtime death) from an explicit
+/// disconnect or a WhatsApp logout (stay down). `needs_session_reset` marks
+/// credentials invalidated by a LoggedOut event: the session sqlite must be
+/// wiped before the next pairing attempt or the client re-loads the dead
+/// credentials and is immediately logged out again.
+#[derive(Default, Clone)]
+struct ReconnectIntent {
+    desired: bool,
+    needs_session_reset: bool,
+    attempts: u32,
+}
+
+const RECONNECT_BASE_DELAY_SECS: u64 = 5;
+const RECONNECT_MAX_DELAY_SECS: u64 = 300;
+
+/// Removes the session sqlite (plus -shm/-wal sidecars) for a channel so the
+/// next connect performs a fresh QR pairing instead of resuming dead
+/// credentials.
+pub fn wipe_session_files(session_path: &std::path::Path) {
+    for suffix in ["", "-shm", "-wal"] {
+        let mut os_path = session_path.as_os_str().to_owned();
+        os_path.push(suffix);
+        let path = PathBuf::from(os_path);
+        match fs::remove_file(&path) {
+            Ok(()) => tracing::info!(path = %path.display(), "removed WhatsApp session file"),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                tracing::warn!(path = %path.display(), %err, "failed to remove WhatsApp session file");
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +338,65 @@ pub enum WhatsappEvent {
 }
 
 impl WhatsappManager {
+    pub fn set_desired(&self, channel_id: &str, desired: bool) {
+        self.intents
+            .lock()
+            .expect("whatsapp intents lock poisoned")
+            .entry(channel_id.to_string())
+            .or_default()
+            .desired = desired;
+    }
+
+    pub fn is_desired(&self, channel_id: &str) -> bool {
+        self.intents
+            .lock()
+            .expect("whatsapp intents lock poisoned")
+            .get(channel_id)
+            .is_some_and(|intent| intent.desired)
+    }
+
+    pub fn mark_needs_session_reset(&self, channel_id: &str) {
+        self.intents
+            .lock()
+            .expect("whatsapp intents lock poisoned")
+            .entry(channel_id.to_string())
+            .or_default()
+            .needs_session_reset = true;
+    }
+
+    /// Returns and clears the pending session-reset flag for the channel.
+    pub fn take_needs_session_reset(&self, channel_id: &str) -> bool {
+        let mut intents = self.intents.lock().expect("whatsapp intents lock poisoned");
+        match intents.get_mut(channel_id) {
+            Some(intent) if intent.needs_session_reset => {
+                intent.needs_session_reset = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Increments the retry counter and returns the delay to wait before the
+    /// next reconnect attempt: 5s doubling up to a 300s ceiling.
+    pub fn next_reconnect_delay_secs(&self, channel_id: &str) -> u64 {
+        let mut intents = self.intents.lock().expect("whatsapp intents lock poisoned");
+        let intent = intents.entry(channel_id.to_string()).or_default();
+        let attempt = intent.attempts.min(16);
+        intent.attempts = intent.attempts.saturating_add(1);
+        (RECONNECT_BASE_DELAY_SECS << attempt).min(RECONNECT_MAX_DELAY_SECS)
+    }
+
+    pub fn reset_reconnect_backoff(&self, channel_id: &str) {
+        if let Some(intent) = self
+            .intents
+            .lock()
+            .expect("whatsapp intents lock poisoned")
+            .get_mut(channel_id)
+        {
+            intent.attempts = 0;
+        }
+    }
+
     pub fn is_channel_active(&self, channel_id: &str) -> bool {
         self.supervisors
             .lock()
@@ -301,25 +431,20 @@ impl WhatsappManager {
         F: Fn(ChannelRuntime, WhatsappEvent) -> Fut + Clone + Send + Sync + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
+        // ponytail: channel starts are rare; one lock prevents duplicate pairing clients.
+        let _start_guard = self.start_lock.lock().await;
         {
             let mut supervisors = self
                 .supervisors
                 .lock()
                 .expect("whatsapp manager lock poisoned");
-            let existing_is_connected =
-                supervisors
-                    .get(&runtime.channel_id)
-                    .is_some_and(|supervisor| {
-                        !supervisor.task.is_finished() && supervisor.client.is_connected()
-                    });
-            if existing_is_connected {
+            if supervisors
+                .get(&runtime.channel_id)
+                .is_some_and(|supervisor| !supervisor.task.is_finished())
+            {
                 return Ok(());
             }
-            if let Some(supervisor) = supervisors.remove(&runtime.channel_id)
-                && !supervisor.task.is_finished()
-            {
-                supervisor.task.abort();
-            }
+            supervisors.remove(&runtime.channel_id);
         }
 
         if let Some(parent) = runtime.session_path.parent() {
@@ -362,7 +487,7 @@ impl WhatsappManager {
         let task_handler = on_event.clone();
         let task = tokio::spawn(async move {
             let reason = match bot.run().await {
-                Ok(handle) => match handle.await {
+                Ok(handle) => match AbortOnDrop::new(handle, BotHandle::abort).await {
                     Ok(()) => "bot_task_finished".to_string(),
                     Err(err) => {
                         tracing::warn!(%channel_id, %err, "WhatsApp bot stopped");
@@ -1099,6 +1224,99 @@ mod tests {
 
         assert!(!manager.is_channel_active("ch"));
         assert!(!manager.is_channel_connected("ch"));
+    }
+
+    #[tokio::test]
+    async fn abort_on_drop_cancels_inner_task() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let supervisor = tokio::spawn(async move {
+            let inner = tokio::spawn(async move {
+                let _drop_signal = DropSignal(Some(dropped_tx));
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+            });
+            let _ = AbortOnDrop::new(inner, tokio::task::JoinHandle::abort).await;
+        });
+
+        started_rx.await.expect("inner task should start");
+        supervisor.abort();
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("inner task was detached")
+            .expect("inner task should be cancelled");
+    }
+
+    #[test]
+    fn reconnect_delay_doubles_and_caps_at_max() {
+        let manager = WhatsappManager::default();
+
+        assert_eq!(manager.next_reconnect_delay_secs("ch"), 5);
+        assert_eq!(manager.next_reconnect_delay_secs("ch"), 10);
+        assert_eq!(manager.next_reconnect_delay_secs("ch"), 20);
+        assert_eq!(manager.next_reconnect_delay_secs("ch"), 40);
+        assert_eq!(manager.next_reconnect_delay_secs("ch"), 80);
+        assert_eq!(manager.next_reconnect_delay_secs("ch"), 160);
+        assert_eq!(manager.next_reconnect_delay_secs("ch"), 300);
+        assert_eq!(manager.next_reconnect_delay_secs("ch"), 300);
+
+        manager.reset_reconnect_backoff("ch");
+        assert_eq!(manager.next_reconnect_delay_secs("ch"), 5);
+    }
+
+    #[test]
+    fn desired_flag_tracks_connect_intent() {
+        let manager = WhatsappManager::default();
+
+        assert!(!manager.is_desired("ch"));
+        manager.set_desired("ch", true);
+        assert!(manager.is_desired("ch"));
+        manager.set_desired("ch", false);
+        assert!(!manager.is_desired("ch"));
+    }
+
+    #[test]
+    fn session_reset_flag_is_consumed_once() {
+        let manager = WhatsappManager::default();
+
+        assert!(!manager.take_needs_session_reset("ch"));
+        manager.mark_needs_session_reset("ch");
+        assert!(manager.take_needs_session_reset("ch"));
+        assert!(!manager.take_needs_session_reset("ch"));
+    }
+
+    #[test]
+    fn wipe_session_files_removes_sqlite_and_sidecars() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustzap-wipe-test-{}",
+            uuid::Uuid::now_v7().simple()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let session = dir.join("session.sqlite");
+        for suffix in ["", "-shm", "-wal"] {
+            let mut os_path = session.as_os_str().to_owned();
+            os_path.push(suffix);
+            fs::write(PathBuf::from(os_path), b"x").expect("write session file");
+        }
+
+        wipe_session_files(&session);
+
+        for suffix in ["", "-shm", "-wal"] {
+            let mut os_path = session.as_os_str().to_owned();
+            os_path.push(suffix);
+            assert!(!PathBuf::from(os_path).exists());
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

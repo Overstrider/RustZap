@@ -45,7 +45,7 @@ use crate::{
     whatsapp::{
         ChannelRuntime, ContactProfile, GroupParticipantProfile, GroupProfile,
         InboundMediaDescriptor, OutboundMediaMessage, WhatsappEvent, WhatsappManager,
-        is_updates_surface_jid, qr_expires_at, session_sqlite_path,
+        is_updates_surface_jid, qr_expires_at, session_sqlite_path, wipe_session_files,
     },
 };
 
@@ -1588,18 +1588,44 @@ impl AppState {
         }) {
             self.whatsapp.stop_channel(channel_id);
         }
+        let session_path = session_sqlite_path(
+            self.config.wa_session_sqlite_dir.as_path(),
+            project_id,
+            company_id,
+            channel_id,
+        );
+        let current_status = self
+            .inner
+            .lock()
+            .expect("store lock poisoned")
+            .channels
+            .get(channel_id)
+            .and_then(|channel| channel.get("status"))
+            .and_then(|status| status.as_str())
+            .map(str::to_string);
+        let logged_out = current_status.as_deref() == Some("logged_out");
+        if self.whatsapp.take_needs_session_reset(channel_id) || logged_out {
+            self.whatsapp.stop_channel(channel_id);
+            wipe_session_files(&session_path);
+            self.push_event(new_event(
+                "channel.session_reset",
+                project_id,
+                company_id,
+                Some(channel_id.to_string()),
+                None,
+                None,
+                None,
+                json!({ "reason": "logged_out_credentials_wiped" }),
+            ));
+        }
         let qr = self.set_qr(channel_id, "connecting", None, OffsetDateTime::now_utc());
         self.set_channel_status(channel_id, "connecting", None);
+        self.whatsapp.set_desired(channel_id, true);
         let runtime = ChannelRuntime {
             project_id: project_id.to_string(),
             company_id: company_id.to_string(),
             channel_id: channel_id.to_string(),
-            session_path: session_sqlite_path(
-                self.config.wa_session_sqlite_dir.as_path(),
-                project_id,
-                company_id,
-                channel_id,
-            ),
+            session_path,
         };
         let state = self.clone();
         self.whatsapp
@@ -1614,7 +1640,26 @@ impl AppState {
         Ok(qr)
     }
 
+    /// Type-erased `connect_channel` for use inside the WhatsApp event path.
+    /// The event handler runs within the connect_channel -> start_channel
+    /// future; calling connect_channel there again would make the opaque
+    /// future type self-referential. Boxing breaks the cycle.
+    fn connect_channel_boxed(
+        &self,
+        project_id: String,
+        company_id: String,
+        channel_id: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ApiResult<QrState>> + Send>> {
+        let state = self.clone();
+        Box::pin(async move {
+            state
+                .connect_channel(&project_id, &company_id, &channel_id)
+                .await
+        })
+    }
+
     pub fn disconnect_channel(&self, channel_id: &str) -> Value {
+        self.whatsapp.set_desired(channel_id, false);
         self.whatsapp.stop_channel(channel_id);
         let mut inner = self.inner.lock().expect("store lock poisoned");
         let channel = if let Some(channel) = inner.channels.get_mut(channel_id) {
@@ -2520,6 +2565,7 @@ impl AppState {
             }
             WhatsappEvent::Connected => {
                 let connected_at = OffsetDateTime::now_utc();
+                self.whatsapp.reset_reconnect_backoff(&runtime.channel_id);
                 self.set_channel_status(&runtime.channel_id, "connected", Some(connected_at));
                 self.push_event(new_event(
                     "channel.connected",
@@ -2533,7 +2579,21 @@ impl AppState {
                 ));
             }
             WhatsappEvent::Disconnected => {
-                self.set_channel_status(&runtime.channel_id, "disconnected", None);
+                // A LoggedOut event is followed by a Disconnected event when the
+                // bot task unwinds; keep the terminal logged_out status so the
+                // next connect knows the credentials are dead.
+                let logged_out = self
+                    .inner
+                    .lock()
+                    .expect("store lock poisoned")
+                    .channels
+                    .get(&runtime.channel_id)
+                    .and_then(|channel| channel.get("status"))
+                    .and_then(|status| status.as_str())
+                    == Some("logged_out");
+                if !logged_out {
+                    self.set_channel_status(&runtime.channel_id, "disconnected", None);
+                }
                 self.push_event(new_event(
                     "channel.disconnected",
                     &runtime.project_id,
@@ -2546,7 +2606,28 @@ impl AppState {
                 ));
             }
             WhatsappEvent::LoggedOut { reason } => {
+                self.whatsapp.set_desired(&runtime.channel_id, false);
+                self.whatsapp.mark_needs_session_reset(&runtime.channel_id);
                 self.set_channel_status(&runtime.channel_id, "logged_out", None);
+                // Wipe the invalidated credentials off-task: this handler can run
+                // inside the bot task itself, and stop_channel aborts that task.
+                // take_needs_session_reset in connect_channel is the fallback if
+                // this task is cancelled before the wipe completes.
+                {
+                    let state = self.clone();
+                    let channel_id = runtime.channel_id.clone();
+                    let session_path = runtime.session_path.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        // A new connect may have started a fresh pairing session
+                        // in the meantime — leave it alone.
+                        if state.whatsapp.is_desired(&channel_id) {
+                            return;
+                        }
+                        state.whatsapp.stop_channel(&channel_id);
+                        wipe_session_files(&session_path);
+                    });
+                }
                 self.push_event(new_event(
                     "channel.logged_out",
                     &runtime.project_id,
@@ -2818,6 +2899,8 @@ impl AppState {
                         .and_then(|value| value.as_str())
                         .unwrap_or_default();
                     let status = if reason.contains("LoggedOut") {
+                        self.whatsapp.set_desired(&runtime.channel_id, false);
+                        self.whatsapp.mark_needs_session_reset(&runtime.channel_id);
                         "logged_out"
                     } else {
                         "disconnected"
@@ -2825,16 +2908,57 @@ impl AppState {
                     self.set_channel_status(&runtime.channel_id, status, None);
                     self.set_qr(&runtime.channel_id, status, None, OffsetDateTime::now_utc());
                 }
+                let respawn = event_type == "channel.runtime_stopped"
+                    && self.whatsapp.is_desired(&runtime.channel_id);
                 self.push_event(new_event(
                     &event_type,
                     &runtime.project_id,
                     &runtime.company_id,
-                    Some(runtime.channel_id),
+                    Some(runtime.channel_id.clone()),
                     None,
                     None,
                     None,
                     payload,
                 ));
+                // The bot task died while the channel was still wanted (network
+                // drop, upstream error). Respawn it with exponential backoff so
+                // the channel does not stay down until a human presses connect.
+                if respawn {
+                    let delay_secs = self.whatsapp.next_reconnect_delay_secs(&runtime.channel_id);
+                    self.push_event(new_event(
+                        "channel.reconnect_scheduled",
+                        &runtime.project_id,
+                        &runtime.company_id,
+                        Some(runtime.channel_id.clone()),
+                        None,
+                        None,
+                        None,
+                        json!({ "delay_secs": delay_secs }),
+                    ));
+                    let state = self.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+                        if !state.whatsapp.is_desired(&runtime.channel_id)
+                            || state.whatsapp.is_channel_active(&runtime.channel_id)
+                        {
+                            return;
+                        }
+                        if let Err(err) = state
+                            .connect_channel_boxed(
+                                runtime.project_id.clone(),
+                                runtime.company_id.clone(),
+                                runtime.channel_id.clone(),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                channel_id = %runtime.channel_id,
+                                %err,
+                                "scheduled WhatsApp reconnect failed"
+                            );
+                        }
+                    });
+                }
             }
         }
     }
