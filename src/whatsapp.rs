@@ -270,6 +270,7 @@ where
 struct ReconnectIntent {
     desired: bool,
     needs_session_reset: bool,
+    has_connected: bool,
     attempts: u32,
 }
 
@@ -356,12 +357,11 @@ impl WhatsappManager {
     }
 
     pub fn mark_needs_session_reset(&self, channel_id: &str) {
-        self.intents
-            .lock()
-            .expect("whatsapp intents lock poisoned")
-            .entry(channel_id.to_string())
-            .or_default()
-            .needs_session_reset = true;
+        let mut intents = self.intents.lock().expect("whatsapp intents lock poisoned");
+        let intent = intents.entry(channel_id.to_string()).or_default();
+        intent.needs_session_reset = true;
+        intent.has_connected = false;
+        intent.attempts = 0;
     }
 
     /// Returns and clears the pending session-reset flag for the channel.
@@ -386,15 +386,19 @@ impl WhatsappManager {
         (RECONNECT_BASE_DELAY_SECS << attempt).min(RECONNECT_MAX_DELAY_SECS)
     }
 
-    pub fn reset_reconnect_backoff(&self, channel_id: &str) {
-        if let Some(intent) = self
-            .intents
+    pub fn mark_connected(&self, channel_id: &str) {
+        let mut intents = self.intents.lock().expect("whatsapp intents lock poisoned");
+        let intent = intents.entry(channel_id.to_string()).or_default();
+        intent.has_connected = true;
+        intent.attempts = 0;
+    }
+
+    pub fn should_reconnect(&self, channel_id: &str) -> bool {
+        self.intents
             .lock()
             .expect("whatsapp intents lock poisoned")
-            .get_mut(channel_id)
-        {
-            intent.attempts = 0;
-        }
+            .get(channel_id)
+            .is_some_and(|intent| intent.desired && intent.has_connected)
     }
 
     pub fn is_channel_active(&self, channel_id: &str) -> bool {
@@ -1270,8 +1274,22 @@ mod tests {
         assert_eq!(manager.next_reconnect_delay_secs("ch"), 300);
         assert_eq!(manager.next_reconnect_delay_secs("ch"), 300);
 
-        manager.reset_reconnect_backoff("ch");
+        manager.mark_connected("ch");
         assert_eq!(manager.next_reconnect_delay_secs("ch"), 5);
+    }
+
+    #[test]
+    fn pairing_channel_does_not_auto_reconnect() {
+        let manager = WhatsappManager::default();
+
+        manager.set_desired("ch", true);
+        assert!(!manager.should_reconnect("ch"));
+
+        manager.mark_connected("ch");
+        assert!(manager.should_reconnect("ch"));
+
+        manager.mark_needs_session_reset("ch");
+        assert!(!manager.should_reconnect("ch"));
     }
 
     #[test]

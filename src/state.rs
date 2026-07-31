@@ -1550,7 +1550,7 @@ impl AppState {
         channel_id: &str,
     ) -> ApiResult<QrState> {
         self.channel_for_company(project_id, company_id, channel_id)?;
-        let already_connected = self
+        let stored_connected = self
             .inner
             .lock()
             .expect("store lock poisoned")
@@ -1558,8 +1558,8 @@ impl AppState {
             .get(channel_id)
             .and_then(|channel| channel.get("status"))
             .and_then(|status| status.as_str())
-            == Some("connected")
-            && self.whatsapp.is_channel_connected(channel_id);
+            == Some("connected");
+        let already_connected = stored_connected && self.whatsapp.is_channel_connected(channel_id);
         if already_connected {
             return Ok(QrState {
                 channel_id: channel_id.to_string(),
@@ -1567,6 +1567,9 @@ impl AppState {
                 qr_code_text: None,
                 expires_at: OffsetDateTime::now_utc(),
             });
+        }
+        if stored_connected {
+            self.whatsapp.mark_connected(channel_id);
         }
         let now = OffsetDateTime::now_utc();
         let cached_qr = self
@@ -2565,7 +2568,7 @@ impl AppState {
             }
             WhatsappEvent::Connected => {
                 let connected_at = OffsetDateTime::now_utc();
-                self.whatsapp.reset_reconnect_backoff(&runtime.channel_id);
+                self.whatsapp.mark_connected(&runtime.channel_id);
                 self.set_channel_status(&runtime.channel_id, "connected", Some(connected_at));
                 self.push_event(new_event(
                     "channel.connected",
@@ -2909,7 +2912,7 @@ impl AppState {
                     self.set_qr(&runtime.channel_id, status, None, OffsetDateTime::now_utc());
                 }
                 let respawn = event_type == "channel.runtime_stopped"
-                    && self.whatsapp.is_desired(&runtime.channel_id);
+                    && self.whatsapp.should_reconnect(&runtime.channel_id);
                 self.push_event(new_event(
                     &event_type,
                     &runtime.project_id,
@@ -2920,9 +2923,8 @@ impl AppState {
                     None,
                     payload,
                 ));
-                // The bot task died while the channel was still wanted (network
-                // drop, upstream error). Respawn it with exponential backoff so
-                // the channel does not stay down until a human presses connect.
+                // Retry previously connected sessions after network/provider
+                // failures. Unpaired QR sessions wait for an explicit retry.
                 if respawn {
                     let delay_secs = self.whatsapp.next_reconnect_delay_secs(&runtime.channel_id);
                     self.push_event(new_event(
