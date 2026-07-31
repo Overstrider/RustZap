@@ -19,7 +19,11 @@ use wacore::{
     types::{events::Event, message::MessageInfo, presence::ReceiptType},
 };
 use waproto::whatsapp as wa;
-use whatsapp_rust::{Client, Jid, TokioRuntime, bot::Bot, store::SqliteStore};
+use whatsapp_rust::{
+    Client, Jid, TokioRuntime,
+    bot::{Bot, BotHandle},
+    store::SqliteStore,
+};
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
 
@@ -217,11 +221,43 @@ pub struct InboundMediaDescriptor {
 pub struct WhatsappManager {
     supervisors: Arc<Mutex<HashMap<String, ChannelSupervisor>>>,
     intents: Arc<Mutex<HashMap<String, ReconnectIntent>>>,
+    start_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 struct ChannelSupervisor {
     client: Arc<Client>,
     task: Arc<tokio::task::JoinHandle<()>>,
+}
+
+struct AbortOnDrop<T> {
+    task: T,
+    abort: fn(&T),
+}
+
+impl<T> AbortOnDrop<T> {
+    fn new(task: T, abort: fn(&T)) -> Self {
+        Self { task, abort }
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        (self.abort)(&self.task);
+    }
+}
+
+impl<T> std::future::Future for AbortOnDrop<T>
+where
+    T: std::future::Future + Unpin,
+{
+    type Output = T::Output;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.task).poll(cx)
+    }
 }
 
 /// Per-channel reconnection bookkeeping. `desired` distinguishes an operator
@@ -395,25 +431,20 @@ impl WhatsappManager {
         F: Fn(ChannelRuntime, WhatsappEvent) -> Fut + Clone + Send + Sync + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
+        // ponytail: channel starts are rare; one lock prevents duplicate pairing clients.
+        let _start_guard = self.start_lock.lock().await;
         {
             let mut supervisors = self
                 .supervisors
                 .lock()
                 .expect("whatsapp manager lock poisoned");
-            let existing_is_connected =
-                supervisors
-                    .get(&runtime.channel_id)
-                    .is_some_and(|supervisor| {
-                        !supervisor.task.is_finished() && supervisor.client.is_connected()
-                    });
-            if existing_is_connected {
+            if supervisors
+                .get(&runtime.channel_id)
+                .is_some_and(|supervisor| !supervisor.task.is_finished())
+            {
                 return Ok(());
             }
-            if let Some(supervisor) = supervisors.remove(&runtime.channel_id)
-                && !supervisor.task.is_finished()
-            {
-                supervisor.task.abort();
-            }
+            supervisors.remove(&runtime.channel_id);
         }
 
         if let Some(parent) = runtime.session_path.parent() {
@@ -456,7 +487,7 @@ impl WhatsappManager {
         let task_handler = on_event.clone();
         let task = tokio::spawn(async move {
             let reason = match bot.run().await {
-                Ok(handle) => match handle.await {
+                Ok(handle) => match AbortOnDrop::new(handle, BotHandle::abort).await {
                     Ok(()) => "bot_task_finished".to_string(),
                     Err(err) => {
                         tracing::warn!(%channel_id, %err, "WhatsApp bot stopped");
@@ -1193,6 +1224,37 @@ mod tests {
 
         assert!(!manager.is_channel_active("ch"));
         assert!(!manager.is_channel_connected("ch"));
+    }
+
+    #[tokio::test]
+    async fn abort_on_drop_cancels_inner_task() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let supervisor = tokio::spawn(async move {
+            let inner = tokio::spawn(async move {
+                let _drop_signal = DropSignal(Some(dropped_tx));
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+            });
+            let _ = AbortOnDrop::new(inner, tokio::task::JoinHandle::abort).await;
+        });
+
+        started_rx.await.expect("inner task should start");
+        supervisor.abort();
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("inner task was detached")
+            .expect("inner task should be cancelled");
     }
 
     #[test]

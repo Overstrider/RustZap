@@ -2939,7 +2939,7 @@ impl AppState {
                     tokio::spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
                         if !state.whatsapp.is_desired(&runtime.channel_id)
-                            || state.whatsapp.is_channel_connected(&runtime.channel_id)
+                            || state.whatsapp.is_channel_active(&runtime.channel_id)
                         {
                             return;
                         }
