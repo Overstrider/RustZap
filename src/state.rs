@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, watch};
 use uuid::Uuid;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
@@ -65,7 +65,7 @@ pub struct AppState {
     media_bytes: MediaByteStore,
     dev_state_path: Option<PathBuf>,
     metadata_db: Option<Arc<MetadataDb>>,
-    metadata_persist_tx: Option<mpsc::UnboundedSender<PersistedStore>>,
+    metadata_persist_tx: Option<watch::Sender<Arc<PersistedStore>>>,
 }
 
 pub struct SendMessageOutcome {
@@ -943,11 +943,13 @@ impl AppState {
             .map(PersistedStore::into_inner)
             .unwrap_or_default();
         let (events_tx, _) = broadcast::channel(1024);
+        // Full-state snapshots are large; watch coalesces writes to the latest state.
         let (metadata_persist_tx, mut metadata_persist_rx) =
-            mpsc::unbounded_channel::<PersistedStore>();
+            watch::channel(Arc::new(PersistedStore::default()));
         let metadata_persist_db = metadata_db.clone();
         tokio::spawn(async move {
-            while let Some(snapshot) = metadata_persist_rx.recv().await {
+            while metadata_persist_rx.changed().await.is_ok() {
+                let snapshot = metadata_persist_rx.borrow_and_update().clone();
                 if let Err(err) = metadata_persist_db.persist_store(&snapshot).await {
                     tracing::error!(error = %err, "failed to persist metadata to Postgres");
                 }
@@ -1366,9 +1368,7 @@ impl AppState {
             }
         }
         if let Some(tx) = self.metadata_persist_tx.as_ref() {
-            if let Err(err) = tx.send(snapshot) {
-                tracing::error!(error = %err, "failed to queue metadata persistence");
-            }
+            tx.send_replace(Arc::new(snapshot));
         } else if let Some(metadata_db) = self.metadata_db.as_ref()
             && let Err(err) = persist_metadata_blocking(metadata_db.clone(), snapshot)
         {
