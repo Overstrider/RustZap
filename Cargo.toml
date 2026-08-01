@@ -26,11 +26,11 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["serde", "v4", "v7"] }
-whatsapp-rust = { version = "0.5.0", default-features = false, features = ["sqlite-storage", "tokio-transport", "tokio-runtime", "ureq-client", "tokio-native", "signal", "moka-cache"] }
-wacore = { version = "0.5.0", default-features = false }
-waproto = "0.5.0"
-whatsapp-rust-tokio-transport = "0.5.0"
-whatsapp-rust-ureq-http-client = "0.5.0"
+whatsapp-rust = { version = "0.6.0", default-features = false, features = ["sqlite-storage", "tokio-transport", "tokio-runtime", "ureq-client", "tokio-native", "signal", "moka-cache"] }
+wacore = { version = "0.6.0", default-features = false }
+waproto = "0.6.0"
+whatsapp-rust-tokio-transport = "0.6.0"
+whatsapp-rust-ureq-http-client = "0.6.0"
 
 rdkafka = { version = "0.39.0", optional = true }
 sqlx-core = { version = "0.8.6", default-features = false, features = ["json", "time", "uuid", "migrate", "_rt-tokio", "_tls-rustls-ring-webpki"] }

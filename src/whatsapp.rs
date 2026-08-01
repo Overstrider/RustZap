@@ -12,15 +12,17 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use time::{Duration, OffsetDateTime};
+use uuid::Uuid;
 use wacore::{
     download::MediaType,
+    iq::usync::UserInfoSpec,
     proto_helpers::MessageExt,
     stanza::groups::GroupNotificationAction,
     types::{events::Event, message::MessageInfo, presence::ReceiptType},
 };
 use waproto::whatsapp as wa;
 use whatsapp_rust::{
-    Client, Jid, TokioRuntime,
+    Client, Jid, TokioRuntime, UploadOptions,
     bot::{Bot, BotHandle},
     store::SqliteStore,
 };
@@ -475,7 +477,7 @@ impl WhatsappManager {
                 let handler = event_handler.clone();
                 async move {
                     client.set_skip_history_sync(true);
-                    if let Some(mapped) = map_event(event) {
+                    if let Some(mapped) = map_event((*event).clone()) {
                         handler(runtime, mapped).await;
                     }
                 }
@@ -540,7 +542,10 @@ impl WhatsappManager {
             conversation: Some(text.to_string()),
             ..Default::default()
         };
-        client.send_message(to, message).await
+        client
+            .send_message(to, message)
+            .await
+            .map(|result| result.message_id)
     }
 
     pub async fn send_media(
@@ -567,10 +572,10 @@ impl WhatsappManager {
             other => return Err(anyhow!("unsupported outbound media type {other}")),
         };
         let upload = client
-            .upload(bytes, wa_media_type)
+            .upload(bytes, wa_media_type, UploadOptions::default())
             .await
             .with_context(|| format!("failed to upload {media_type} to WhatsApp"))?;
-        let media_key_timestamp = Some(OffsetDateTime::now_utc().unix_timestamp());
+        let media_key_timestamp = Some(upload.media_key_timestamp);
         let caption = caption
             .as_deref()
             .map(str::trim)
@@ -582,10 +587,10 @@ impl WhatsappManager {
                     url: Some(upload.url),
                     mimetype: Some(mime_type),
                     caption,
-                    file_sha256: Some(upload.file_sha256),
+                    file_sha256: Some(upload.file_sha256.to_vec()),
                     file_length: Some(upload.file_length),
-                    media_key: Some(upload.media_key),
-                    file_enc_sha256: Some(upload.file_enc_sha256),
+                    media_key: Some(upload.media_key.to_vec()),
+                    file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
                     direct_path: Some(upload.direct_path),
                     media_key_timestamp,
                     ..Default::default()
@@ -596,11 +601,11 @@ impl WhatsappManager {
                 audio_message: Some(Box::new(wa::message::AudioMessage {
                     url: Some(upload.url),
                     mimetype: Some(mime_type),
-                    file_sha256: Some(upload.file_sha256),
+                    file_sha256: Some(upload.file_sha256.to_vec()),
                     file_length: Some(upload.file_length),
                     ptt: Some(ptt),
-                    media_key: Some(upload.media_key),
-                    file_enc_sha256: Some(upload.file_enc_sha256),
+                    media_key: Some(upload.media_key.to_vec()),
+                    file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
                     direct_path: Some(upload.direct_path),
                     media_key_timestamp,
                     ..Default::default()
@@ -614,11 +619,11 @@ impl WhatsappManager {
                         url: Some(upload.url),
                         mimetype: Some(mime_type),
                         title: Some(file_name.clone()),
-                        file_sha256: Some(upload.file_sha256),
+                        file_sha256: Some(upload.file_sha256.to_vec()),
                         file_length: Some(upload.file_length),
-                        media_key: Some(upload.media_key),
+                        media_key: Some(upload.media_key.to_vec()),
                         file_name: Some(file_name),
-                        file_enc_sha256: Some(upload.file_enc_sha256),
+                        file_enc_sha256: Some(upload.file_enc_sha256.to_vec()),
                         direct_path: Some(upload.direct_path),
                         media_key_timestamp,
                         caption,
@@ -629,7 +634,10 @@ impl WhatsappManager {
             }
             _ => unreachable!("wa_media_type is constrained above"),
         };
-        client.send_message(to, message).await
+        client
+            .send_message(to, message)
+            .await
+            .map(|result| result.message_id)
     }
 
     pub async fn download_inbound_media_to_writer<W>(
@@ -707,6 +715,7 @@ impl WhatsappManager {
                 },
             )
             .await
+            .map(|result| result.message_id)
     }
 
     pub async fn contact_profile(&self, channel_id: &str, jid: &str) -> Result<ContactProfile> {
@@ -726,9 +735,11 @@ impl WhatsappManager {
 
         match tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            client
-                .contacts()
-                .get_user_info(std::slice::from_ref(&requested)),
+            // ponytail: bypass whatsapp-rust 0.6.0 #826's non-Send wrapper until its next release.
+            client.execute(UserInfoSpec::new(
+                vec![requested.clone()],
+                Uuid::new_v4().to_string(),
+            )),
         )
         .await
         {
@@ -847,7 +858,7 @@ impl WhatsappManager {
             .map(|participant| GroupParticipantProfile {
                 contact_id: participant.jid.to_string(),
                 phone_jid: participant.phone_number.as_ref().map(ToString::to_string),
-                is_admin: participant.is_admin,
+                is_admin: participant.is_admin(),
             })
             .collect();
 
@@ -954,7 +965,7 @@ fn map_event(event: Event) -> Option<WhatsappEvent> {
             if message_info_has_updates_surface(&info) {
                 return Some(updates_ignored_event());
             }
-            let mapped = map_message_event(*message, info);
+            let mapped = map_message_event((*message).clone(), (*info).clone());
             match &mapped {
                 WhatsappEvent::Message {
                     message_type, text, ..
