@@ -1639,7 +1639,10 @@ impl AppState {
                 }
             })
             .await
-            .map_err(|err| ApiError::Internal(format!("failed to start WhatsApp: {err}")))?;
+            .map_err(|err| {
+                tracing::error!(error = ?err, %channel_id, "failed to start WhatsApp");
+                ApiError::Internal(format!("failed to start WhatsApp: {err}"))
+            })?;
         Ok(qr)
     }
 
